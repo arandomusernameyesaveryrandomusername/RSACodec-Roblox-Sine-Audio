@@ -1,2 +1,7 @@
 Audio Codec 4 Roblox :P
-VIbe Coded without claude code somehow asdasduifjhaksd
+
+This uses Addditve synthesis and is WIP
+
+I am bad at github so expect this repo to be crappy
+
+DONT SUE ME ROBLOX
