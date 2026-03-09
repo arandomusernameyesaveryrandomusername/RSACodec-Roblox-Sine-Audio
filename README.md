@@ -14,4 +14,4 @@ If you want to try to make a Roblox decoder, go ahead.
 
 Roblox Decoder is WIP
 
-Python Decoder IS finished, will be sharing soon
+Python Decoder IS finished and released
