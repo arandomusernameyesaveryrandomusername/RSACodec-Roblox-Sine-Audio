@@ -10,6 +10,8 @@ I am bad at github so expect this repo to be crappy
 
 DONT SUE ME ROBLOX
 THIS REPO CAN ONLY BE EDITED BY ME, AND ME ONLY.
-If you want to try to make a decoder, go ahead.
+If you want to try to make a Roblox decoder, go ahead.
 
-Offical Decoder is WIP
+Roblox Decoder is WIP
+
+Python Decoder IS finished, will be sharing soon
