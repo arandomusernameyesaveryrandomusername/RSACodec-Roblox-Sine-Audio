@@ -22,7 +22,7 @@ from scipy.signal import find_peaks
 #  Constants
 # ─────────────────────────────────────────────
 TARGET_FPS        = 60
-DEFAULT_PARTIALS  = 64
+DEFAULT_PARTIALS  = 16
 DEFAULT_SAMPLERATE = 44100
 RSC_MAGIC         = "RSC1"          # File header magic string
 RSC_EXTENSION     = ".rsc"
