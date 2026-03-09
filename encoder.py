@@ -1,400 +1,433 @@
 """
-RSA Encoder - Roblox Sine Audio Format
-=======================================
-Encodes audio into additive sine wave components readable by Roblox Lua.
-
-Format: .rsa (Roblox Sine Audio)
-- Header: "RSA1" magic bytes
-- Metadata: sample_rate, duration, num_frames, frame_size, max_harmonics
-- Frames: Each frame contains N sine wave components (frequency, amplitude, phase)
-
-The decoder in Roblox Lua reconstructs audio by summing sine waves per frame.
+rsc_encoder.py — Roblox Sine Codec (RSC) Encoder
+Decomposes a WAV file into additive sine components per frame and writes
+a Lua-parsable .rsc file.
 
 Usage:
-    python rsa_encoder.py input.wav output.rsa
-    python rsa_encoder.py input.wav output.rsa --harmonics 16 --frame-size 512
-    python rsa_encoder.py --demo output.rsa   (generates a demo tone)
+    python rsc_encoder.py --input audio.wav --output audio.rsc
+    python rsc_encoder.py --input audio.wav --output audio.rsc --partials 24 --samplerate 44100
 """
 
-import struct
 import argparse
+import gzip
+import wave
+import struct
 import math
-import sys
-import os
+import json
+import numpy as np
+from scipy.signal import find_peaks
 
 
-# ─── RSA FORMAT CONSTANTS ────────────────────────────────────────────────────
-
-MAGIC           = b"RSA1"          # 4-byte magic
-FORMAT_VERSION  = 1                # Format version
-MAX_HARMONICS   = 32               # Hard cap per frame
-DEFAULT_HARMONICS = 16
-DEFAULT_FRAME_SIZE = 512           # Samples per analysis frame
-DEFAULT_SAMPLE_RATE = 44100
-
-
-# ─── HELPERS ─────────────────────────────────────────────────────────────────
-
-def log(msg): print(f"  {msg}")
+# ─────────────────────────────────────────────
+#  Constants
+# ─────────────────────────────────────────────
+TARGET_FPS        = 60
+DEFAULT_PARTIALS  = 64
+DEFAULT_SAMPLERATE = 44100
+RSC_MAGIC         = "RSC1"          # File header magic string
+RSC_EXTENSION     = ".rsc"
 
 
-def clamp(val, lo, hi):
-    return max(lo, min(hi, val))
-
-
-# ─── FFT (Pure Python, no numpy required) ────────────────────────────────────
-
-def fft(x):
-    """Cooley-Tukey FFT – x must have power-of-2 length."""
-    N = len(x)
-    if N <= 1:
-        return x
-    if N % 2 != 0:
-        raise ValueError("FFT length must be a power of 2")
-    even = fft(x[0::2])
-    odd  = fft(x[1::2])
-    T = [complex(math.cos(-2 * math.pi * k / N),
-                 math.sin(-2 * math.pi * k / N)) * odd[k % (N // 2)]
-         for k in range(N // 2)]
-    return [even[k] + T[k]       for k in range(N // 2)] + \
-           [even[k] - T[k]       for k in range(N // 2)]
-
-
-def next_power_of_2(n):
-    p = 1
-    while p < n:
-        p <<= 1
-    return p
-
-
-def hann_window(n):
-    """Hann window coefficients."""
-    return [0.5 * (1 - math.cos(2 * math.pi * i / (n - 1))) for i in range(n)]
-
-
-# ─── ANALYSIS ────────────────────────────────────────────────────────────────
-
-def analyse_frame(samples, sample_rate, max_harmonics):
+# ─────────────────────────────────────────────
+#  WAV Loading
+# ─────────────────────────────────────────────
+def load_wav(path: str) -> tuple[np.ndarray, int]:
     """
-    Analyse one frame of PCM samples via FFT.
-    Returns list of (frequency_hz, amplitude_0_to_1, phase_radians)
-    for the top `max_harmonics` partials by amplitude.
+    Load a WAV file and return (mono_float32_samples, sample_rate).
+    Stereo is mixed down to mono. Samples are normalised to [-1, 1].
     """
-    n = len(samples)
-    padded_n = next_power_of_2(n)
+    with wave.open(path, "rb") as wf:
+        n_channels   = wf.getnchannels()
+        sampwidth    = wf.getsampwidth()
+        sample_rate  = wf.getframerate()
+        n_frames     = wf.getnframes()
+        raw          = wf.readframes(n_frames)
 
-    # Apply Hann window
-    window = hann_window(n)
-    windowed = [samples[i] * window[i] for i in range(n)]
-
-    # Zero-pad to next power of 2
-    windowed += [0.0] * (padded_n - n)
-
-    # FFT
-    spectrum = fft([complex(s, 0) for s in windowed])
-
-    # Only use first half (positive frequencies)
-    half = padded_n // 2
-    freq_resolution = sample_rate / padded_n
-
-    bins = []
-    for k in range(1, half):          # skip DC (k=0)
-        freq = k * freq_resolution
-        if freq > 20000:              # above human hearing, skip
-            break
-        amp  = abs(spectrum[k]) / (padded_n / 2)   # normalise
-        phase = math.atan2(spectrum[k].imag, spectrum[k].real)
-        bins.append((amp, freq, phase))
-
-    # Sort by amplitude descending, take top N
-    bins.sort(reverse=True)
-    top = bins[:max_harmonics]
-
-    # Normalise amplitudes relative to strongest partial
-    if top:
-        max_amp = top[0][0] if top[0][0] > 0 else 1.0
-        result = [(freq, clamp(amp / max_amp, 0.0, 1.0), phase)
-                  for amp, freq, phase in top]
+    # Determine dtype from sample width
+    if sampwidth == 1:
+        dtype  = np.uint8
+        scale  = 128.0
+        offset = -128.0 / 128.0   # unsigned 8-bit centres on 128
+    elif sampwidth == 2:
+        dtype  = np.int16
+        scale  = 32768.0
+        offset = 0.0
+    elif sampwidth == 3:
+        # 24-bit: manually unpack to int32
+        raw_array = np.frombuffer(raw, dtype=np.uint8)
+        n_samples = len(raw_array) // 3
+        raw_int32 = np.zeros(n_samples, dtype=np.int32)
+        raw_int32  = (raw_array[0::3].astype(np.int32) |
+                      (raw_array[1::3].astype(np.int32) << 8) |
+                      (raw_array[2::3].astype(np.int32) << 16))
+        # Sign-extend from 24-bit
+        raw_int32[raw_int32 >= 0x800000] -= 0x1000000
+        samples = raw_int32.astype(np.float32) / 8388608.0
+        if n_channels > 1:
+            samples = samples.reshape(-1, n_channels).mean(axis=1)
+        return samples, sample_rate
+    elif sampwidth == 4:
+        dtype  = np.int32
+        scale  = 2147483648.0
+        offset = 0.0
     else:
-        result = []
+        raise ValueError(f"Unsupported sample width: {sampwidth} bytes")
 
-    return result
+    samples = np.frombuffer(raw, dtype=dtype).astype(np.float32)
+    if sampwidth == 1:
+        samples = (samples - 128.0) / 128.0
+    else:
+        samples = samples / scale + offset
+
+    if n_channels > 1:
+        samples = samples.reshape(-1, n_channels).mean(axis=1)
+
+    return samples, sample_rate
 
 
-# ─── WAV READER (no external libs) ───────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  Normalisation
+# ─────────────────────────────────────────────
+def normalize(samples: np.ndarray) -> np.ndarray:
+    """Peak-normalise audio to [-1, 1]."""
+    peak = np.max(np.abs(samples))
+    if peak < 1e-9:
+        return samples
+    return samples / peak
 
-def read_wav(path):
+
+# ─────────────────────────────────────────────
+#  Wide-Window FFT Analysis + Peak Tracking
+# ─────────────────────────────────────────────
+
+# Analysis window is intentionally much larger than the hop size.
+# hop  ≈ 735 samples = 16.7 ms  → 60 FPS output rate
+# win  = 4096 samples = 92.9 ms → ~10.8 Hz frequency resolution
+# This gives stable, well-resolved peaks while still updating at 60 FPS.
+ANALYSIS_WIN = 4096
+
+def _fft_candidates(
+    audio: np.ndarray,
+    center: int,
+    analysis_win: int,
+    sample_rate: int,
+    n_candidates: int,
+) -> list[tuple[float, float, float]]:
     """
-    Read a WAV file. Returns (sample_rate, samples_list_of_float).
-    Supports 8-bit, 16-bit, 24-bit, 32-bit PCM and 32-bit float.
-    Mixes down to mono.
+    Extract FFT peak candidates from a large window centred on `center`.
+    Returns up to n_candidates (freq, amp, phase) tuples sorted by amplitude.
     """
-    with open(path, "rb") as f:
-        data = f.read()
+    half = analysis_win // 2
+    start = center - half
+    end   = center + half
 
-    def u16(offset): return struct.unpack_from("<H", data, offset)[0]
-    def u32(offset): return struct.unpack_from("<I", data, offset)[0]
-    def i16(offset): return struct.unpack_from("<h", data, offset)[0]
+    # Slice with zero-padding if we're near the signal boundaries
+    if start < 0 or end > len(audio):
+        chunk = np.zeros(analysis_win, dtype=np.float64)
+        src_s = max(0, start)
+        src_e = min(len(audio), end)
+        dst_s = src_s - start
+        dst_e = dst_s + (src_e - src_s)
+        chunk[dst_s:dst_e] = audio[src_s:src_e]
+    else:
+        chunk = audio[start:end].astype(np.float64)
 
-    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
-        raise ValueError("Not a valid WAV file")
+    window     = np.hanning(analysis_win)
+    windowed   = chunk * window
+    spectrum   = np.fft.rfft(windowed)
+    freqs      = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate)
+    magnitudes = np.abs(spectrum) * (2.0 / np.sum(window))
+    phases     = np.angle(spectrum)
 
-    # Walk chunks
-    pos = 12
-    fmt_chunk = None
-    data_chunk = None
+    bin_width    = sample_rate / analysis_win       # ≈10.8 Hz
+    min_distance = max(1, int(20.0 / bin_width))
+    peak_indices, _ = find_peaks(magnitudes, distance=min_distance, height=1e-6)
 
-    while pos < len(data) - 8:
-        chunk_id   = data[pos:pos+4]
-        chunk_size = u32(pos + 4)
-        chunk_data = data[pos+8 : pos+8+chunk_size]
-        if chunk_id == b"fmt ":
-            fmt_chunk = chunk_data
-        elif chunk_id == b"data":
-            data_chunk = chunk_data
-        pos += 8 + chunk_size
-        if chunk_size % 2: pos += 1   # padding byte
+    if len(peak_indices) == 0:
+        peak_indices = np.argsort(magnitudes)[::-1][:n_candidates]
+    else:
+        order        = np.argsort(magnitudes[peak_indices])[::-1]
+        peak_indices = peak_indices[order[:n_candidates]]
 
-    if not fmt_chunk or not data_chunk:
-        raise ValueError("WAV missing fmt or data chunk")
+    candidates = []
+    for idx in peak_indices:
+        f = float(freqs[idx])
+        if f < 20.0 or f > sample_rate / 2.0 - bin_width:
+            continue
+        a = min(1.0, max(0.0, float(magnitudes[idx])))
+        p = float(phases[idx])
+        candidates.append((f, a, p))
 
-    audio_fmt   = struct.unpack_from("<H", fmt_chunk, 0)[0]
-    num_channels= struct.unpack_from("<H", fmt_chunk, 2)[0]
-    sample_rate = struct.unpack_from("<I", fmt_chunk, 4)[0]
-    bits        = struct.unpack_from("<H", fmt_chunk, 14)[0]
-
-    FLOAT_FMT = 3
-
-    log(f"WAV: {sample_rate} Hz, {num_channels}ch, {bits}-bit, "
-        f"{'float' if audio_fmt==FLOAT_FMT else 'PCM'}")
-
-    # Decode samples
-    samples_raw = []
-    bytes_per_sample = bits // 8
-    total_samples = len(data_chunk) // (bytes_per_sample * num_channels)
-
-    for i in range(total_samples):
-        frame_vals = []
-        base = i * bytes_per_sample * num_channels
-        for c in range(num_channels):
-            off = base + c * bytes_per_sample
-            raw = data_chunk[off : off + bytes_per_sample]
-            if audio_fmt == FLOAT_FMT and bits == 32:
-                val = struct.unpack_from("<f", raw)[0]
-            elif bits == 8:
-                val = (struct.unpack_from("B", raw)[0] - 128) / 128.0
-            elif bits == 16:
-                val = struct.unpack_from("<h", raw)[0] / 32768.0
-            elif bits == 24:
-                b0, b1, b2 = raw[0], raw[1], raw[2]
-                v = b0 | (b1 << 8) | (b2 << 16)
-                if v & 0x800000: v -= 0x1000000
-                val = v / 8388608.0
-            elif bits == 32:
-                val = struct.unpack_from("<i", raw)[0] / 2147483648.0
-            else:
-                val = 0.0
-            frame_vals.append(val)
-        # Mix to mono
-        samples_raw.append(sum(frame_vals) / num_channels)
-
-    return sample_rate, samples_raw
+    return candidates
 
 
-# ─── DEMO TONE GENERATOR ─────────────────────────────────────────────────────
-
-def generate_demo_tone(sample_rate=44100, duration=2.0):
+def _track_peaks(
+    candidates: list[tuple[float, float, float]],
+    prev_partials: list[tuple[float, float, float]],
+    n_partials: int,
+    track_tolerance_hz: float = 50.0,
+) -> list[tuple[float, float, float]]:
     """
-    Generate a synthesised test tone: A4 (440 Hz) with harmonics.
-    Returns list of float samples.
+    Match FFT candidates to previous-frame partials by nearest frequency.
+
+    Why this matters:
+    Raw FFT peaks jitter frame-to-frame — a 440 Hz tone might read as
+    437 Hz one frame and 443 Hz the next just from window phase differences.
+    That jitter causes the decoder's phase accumulator to drift, producing
+    subtle but audible beating/warbling artefacts.
+
+    Algorithm (greedy nearest-neighbour):
+      For each previous partial, find the closest unmatched candidate
+      within track_tolerance_hz.  If found → keep the CANDIDATE's
+      amplitude and phase (fresh data) but record it as a continuation.
+      Unmatched candidates are new births; unmatched prev partials died.
+
+    The final N partials are chosen by amplitude from:
+      continuations + new births (deaths are simply dropped).
     """
-    log("Generating demo tone: A4 (440 Hz) with 6 harmonics, 2 seconds")
-    n = int(sample_rate * duration)
-    samples = []
-    harmonics = [
-        (440.0,  1.00),   # fundamental
-        (880.0,  0.50),   # 2nd
-        (1320.0, 0.33),   # 3rd
-        (1760.0, 0.25),   # 4th
-        (2200.0, 0.15),   # 5th
-        (2640.0, 0.10),   # 6th
+    import copy
+
+    remaining = list(candidates)   # candidates not yet claimed
+    tracked: list[tuple[float, float, float]] = []
+
+    # Sort prev partials by amplitude so strongest get first pick
+    prev_sorted = sorted(prev_partials, key=lambda x: x[1], reverse=True)
+
+    for (pf, pa, pp) in prev_sorted:
+        if not remaining:
+            break
+        # Find the closest candidate in frequency
+        dists  = [abs(cf - pf) for (cf, ca, cp) in remaining]
+        best_i = int(np.argmin(dists))
+        if dists[best_i] <= track_tolerance_hz:
+            cf, ca, cp = remaining.pop(best_i)
+            tracked.append((cf, ca, cp))   # matched continuation
+
+    # Any leftover candidates are new births
+    all_peaks = tracked + remaining
+
+    # Sort by amplitude, take top-N
+    all_peaks.sort(key=lambda x: x[1], reverse=True)
+    chosen = all_peaks[:n_partials]
+
+    # Quantise and pad
+    partials = [
+        (round(f, 2), round(a, 3), round(p, 4))
+        for (f, a, p) in chosen
+        if f > 1e-3 and a > 1e-6
     ]
-    for i in range(n):
-        t = i / sample_rate
-        # Simple envelope: attack 0.05s, decay to sustain, release 0.2s
-        env = 1.0
-        if t < 0.05:
-            env = t / 0.05
-        elif t > duration - 0.2:
-            env = (duration - t) / 0.2
-        s = sum(amp * math.sin(2 * math.pi * freq * t)
-                for freq, amp in harmonics)
-        # Normalise peak
-        s *= (0.8 / sum(amp for _, amp in harmonics))
-        samples.append(s * env)
-    return sample_rate, samples
+    while len(partials) < n_partials:
+        partials.append((0.0, 0.0, 0.0))
+    return partials[:n_partials]
 
 
-# ─── RSA WRITER ──────────────────────────────────────────────────────────────
-
-def write_rsa(path, sample_rate, duration, frames_data, frame_size, max_harmonics):
+def analyse_frame(
+    audio: np.ndarray,
+    center: int,
+    sample_rate: int,
+    n_partials: int,
+    prev_partials: list[tuple[float, float, float]],
+    analysis_win: int = ANALYSIS_WIN,
+) -> list[tuple[float, float, float]]:
     """
-    Write an .rsa binary file.
+    Analyse one hop position and return tracked partials.
 
-    File layout:
-    ┌─────────────────────────────────────────────────────┐
-    │  HEADER  (20 bytes)                                 │
-    │  magic[4]  "RSA1"                                   │
-    │  version[1] u8                                      │
-    │  sample_rate[4] u32                                 │
-    │  duration_ms[4] u32  (milliseconds)                 │
-    │  num_frames[4] u32                                  │
-    │  frame_size[4] u32   (samples per frame)            │
-    │  max_harmonics[1] u8                                │
-    ├─────────────────────────────────────────────────────┤
-    │  FRAMES  (num_frames × entries)                     │
-    │  Each frame:                                        │
-    │    harmonic_count[1] u8                             │
-    │    For each harmonic:                               │
-    │      freq[4]  f32  (Hz)                             │
-    │      amp[2]   u16  (0-65535 mapped from 0.0-1.0)   │
-    │      phase[2] i16  (mapped from -π to π)           │
-    └─────────────────────────────────────────────────────┘
+    Steps:
+      1. Run wide-window FFT centred on `center` to get candidates
+         (fetch 4× as many candidates as partials needed so the tracker
+          has plenty to match against)
+      2. Track candidates against prev_partials to stabilise frequencies
+      3. Return top-N partials
     """
-    num_frames  = len(frames_data)
-    duration_ms = int(duration * 1000)
+    candidates = _fft_candidates(
+        audio, center, analysis_win, sample_rate, n_candidates=n_partials * 4
+    )
+    return _track_peaks(candidates, prev_partials, n_partials)
+
+
+# ─────────────────────────────────────────────
+#  RSC File Writer (Lua-parsable format)
+# ─────────────────────────────────────────────
+def write_rsc(
+    path: str,
+    frames: list[list[tuple[float, float, float]]],
+    sample_rate: int,
+    frame_size: int,
+    n_partials: int,
+    total_samples: int,
+) -> None:
+    """
+    Write encoded frames to a .rsc file.
+
+    Format:
+        Line 0: header comment
+        Line 1: metadata JSON
+        Line 2+: one frame per line as a Lua-table string
+
+        Each frame line:
+            {{f=440.0,a=0.800,p=0.0000},{f=880.0,a=0.400,p=1.5708},...}
+    """
+    metadata = {
+        "magic":         RSC_MAGIC,
+        "version":       1,
+        "sample_rate":   sample_rate,
+        "frame_size":    frame_size,
+        "n_partials":    n_partials,
+        "total_samples": total_samples,
+        "total_frames":  len(frames),
+        "fps_target":    TARGET_FPS,
+    }
+
+    # Build the full text payload in memory, then gzip-compress it.
+    # The decoder auto-detects gzip via the 0x1f 0x8b magic bytes so
+    # the file extension stays .rsc — no format change needed on decode.
+    lines: list[str] = []
+    lines.append(
+        f"-- Roblox Sine Codec (RSC) v1  |  {sample_rate} Hz  |  "
+        f"{n_partials} partials/frame  |  {len(frames)} frames"
+    )
+    lines.append(json.dumps(metadata))
+    for frame in frames:
+        parts = [f"{{f={freq:.2f},a={amp:.3f},p={phase:.4f}}}"
+                 for (freq, amp, phase) in frame]
+        lines.append("{" + ",".join(parts) + "}")
+
+    raw_text    = "\n".join(lines) + "\n"
+    compressed  = gzip.compress(raw_text.encode("utf-8"), compresslevel=9)
 
     with open(path, "wb") as f:
-        # ── Header ────────────────────────────────────────
-        f.write(MAGIC)
-        f.write(struct.pack("B", FORMAT_VERSION))
-        f.write(struct.pack("<I", sample_rate))
-        f.write(struct.pack("<I", duration_ms))
-        f.write(struct.pack("<I", num_frames))
-        f.write(struct.pack("<I", frame_size))
-        f.write(struct.pack("B", max_harmonics))
+        f.write(compressed)
 
-        # ── Frames ────────────────────────────────────────
-        for partials in frames_data:
-            count = min(len(partials), max_harmonics)
-            f.write(struct.pack("B", count))
-            for i in range(count):
-                freq, amp, phase = partials[i]
-                amp_u16   = int(clamp(amp, 0.0, 1.0) * 65535)
-                phase_i16 = int(clamp(phase / math.pi, -1.0, 1.0) * 32767)
-                f.write(struct.pack("<f", freq))
-                f.write(struct.pack("<H", amp_u16))
-                f.write(struct.pack("<h", phase_i16))
-
-    size_kb = os.path.getsize(path) / 1024
-    log(f"Wrote {num_frames} frames → {path}  ({size_kb:.1f} KB)")
+    ratio = len(compressed) / len(raw_text) * 100
+    print(f"  ✅ Wrote {len(frames)} frames → {path}  "
+          f"({len(compressed)//1024} KB compressed, {ratio:.0f}% of raw)")
 
 
-# ─── MAIN ENCODE PIPELINE ────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+#  Main Encode Pipeline
+# ─────────────────────────────────────────────
+def encode(
+    input_path: str,
+    output_path: str,
+    n_partials: int,
+    target_sample_rate: int,
+) -> None:
+    print(f"🎵 RSC Encoder  —  {input_path}")
+    print(f"   Partials/frame : {n_partials}")
+    print(f"   Target SR      : {target_sample_rate} Hz")
 
-def encode(input_path, output_path, max_harmonics, frame_size, verbose):
-    print()
-    print("╔══════════════════════════════════════╗")
-    print("║      RSA Encoder  v1.0               ║")
-    print("║  Roblox Sine Audio Format            ║")
-    print("╚══════════════════════════════════════╝")
-    print()
+    # 1. Load WAV
+    samples, native_sr = load_wav(input_path)
+    print(f"   Native SR      : {native_sr} Hz  |  {len(samples)} samples  "
+          f"({len(samples)/native_sr:.2f}s)")
 
-    # Load audio
-    if input_path == "--demo":
-        log("Mode: DEMO (synthesised test tone)")
-        sample_rate, samples = generate_demo_tone()
+    # 2. Resample if needed (simple linear interp — scipy not required)
+    if native_sr != target_sample_rate:
+        print(f"   Resampling {native_sr} → {target_sample_rate} Hz …")
+        from scipy.signal import resample_poly
+        from math import gcd
+        g = gcd(target_sample_rate, native_sr)
+        up, down = target_sample_rate // g, native_sr // g
+        samples = resample_poly(samples, up, down).astype(np.float32)
+        sample_rate = target_sample_rate
     else:
-        log(f"Reading: {input_path}")
-        sample_rate, samples = read_wav(input_path)
+        sample_rate = native_sr
 
-    duration   = len(samples) / sample_rate
-    num_frames = math.ceil(len(samples) / frame_size)
+    # 3. Normalise
+    samples = normalize(samples)
+    total_samples = len(samples)
 
-    log(f"Duration : {duration:.3f}s  ({len(samples)} samples)")
-    log(f"Frames   : {num_frames}  (frame size: {frame_size} samples)")
-    log(f"Harmonics: up to {max_harmonics} per frame")
+    # 4. Compute frame size for ~60 FPS
+    frame_size = int(round(sample_rate / TARGET_FPS))   # ≈735 @ 44100
+    print(f"   Frame size     : {frame_size} samples  ({1000*frame_size/sample_rate:.2f} ms)")
+
+    # 5. Slice into frames & analyse
+    n_frames = math.ceil(total_samples / frame_size)
+    print(f"   Total frames   : {n_frames}")
+
+    # Pad samples so last frame is full
+    pad_len = n_frames * frame_size - total_samples
+    if pad_len > 0:
+        samples = np.concatenate([samples, np.zeros(pad_len, dtype=np.float32)])
+
+    print(f"   Analysis win   : {ANALYSIS_WIN} samples  "
+          f"({1000*ANALYSIS_WIN/sample_rate:.1f} ms, "
+          f"{sample_rate/ANALYSIS_WIN:.1f} Hz/bin)")
+
+    all_frames: list[list[tuple[float, float, float]]] = []
+    prev_partials: list[tuple[float, float, float]] = []
+
+    for i in range(n_frames):
+        # Centre of this hop in the full audio array
+        center = i * frame_size + frame_size // 2
+
+        partials = analyse_frame(
+            audio=samples,
+            center=center,
+            sample_rate=sample_rate,
+            n_partials=n_partials,
+            prev_partials=prev_partials,
+        )
+        all_frames.append(partials)
+        prev_partials = partials
+
+        if (i + 1) % 500 == 0 or (i + 1) == n_frames:
+            print(f"   … encoded frame {i+1}/{n_frames}", end="\r")
+
     print()
 
-    # Analyse frames
-    frames_data = []
-    hop = frame_size
+    # 6. Write .rsc
+    write_rsc(
+        path=output_path,
+        frames=all_frames,
+        sample_rate=sample_rate,
+        frame_size=frame_size,
+        n_partials=n_partials,
+        total_samples=total_samples,
+    )
 
-    for i in range(num_frames):
-        start = i * hop
-        end   = min(start + frame_size, len(samples))
-        frame_samples = samples[start:end]
-
-        # Pad last frame if needed
-        if len(frame_samples) < frame_size:
-            frame_samples += [0.0] * (frame_size - len(frame_samples))
-
-        partials = analyse_frame(frame_samples, sample_rate, max_harmonics)
-        frames_data.append(partials)
-
-        if verbose or (i % max(1, num_frames // 20) == 0):
-            pct = (i + 1) / num_frames * 100
-            bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
-            print(f"\r  Analysing [{bar}] {pct:5.1f}%  frame {i+1}/{num_frames}", end="", flush=True)
-
-    print()
-    print()
-
-    # Write .rsa file
-    write_rsa(output_path, sample_rate, duration, frames_data, frame_size, max_harmonics)
-
-    # ── Summary ───────────────────────────────────────────
-    total_partials = sum(len(f) for f in frames_data)
-    avg_partials   = total_partials / max(1, num_frames)
-    print()
-    print("  ✓ Encoding complete!")
-    print(f"  Average partials/frame : {avg_partials:.1f}")
-    print(f"  Output                 : {output_path}")
-    print()
-    print("  Next step: use rsa_decoder.lua in Roblox Studio")
-    print()
+    # 7. Stats
+    rsc_size_kb = sum(
+        len("{" + ",".join(f"{{f={f:.2f},a={a:.3f},p={p:.4f}}}" for f,a,p in fr) + "}\n")
+        for fr in all_frames
+    ) / 1024
+    print(f"   📦 Approx data  : {rsc_size_kb:.1f} KB  "
+          f"({rsc_size_kb/1024:.2f} MB)")
+    print("   🎉 Encoding complete!")
 
 
-# ─── CLI ─────────────────────────────────────────────────────────────────────
-
+# ─────────────────────────────────────────────
+#  CLI
+# ─────────────────────────────────────────────
 def main():
     parser = argparse.ArgumentParser(
-        description="RSA Encoder — Convert WAV audio to Roblox Sine Audio format",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python rsa_encoder.py song.wav song.rsa
-  python rsa_encoder.py song.wav song.rsa --harmonics 24 --frame-size 1024
-  python rsa_encoder.py --demo demo_tone.rsa
-        """
+        description="Roblox Sine Codec (RSC) — Encoder",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("input",  help="Input WAV file path, or '--demo' for a test tone")
-    parser.add_argument("output", help="Output .rsa file path")
-    parser.add_argument("--harmonics",  "-n", type=int, default=DEFAULT_HARMONICS,
-                        metavar="N",
-                        help=f"Max sine harmonics per frame (default: {DEFAULT_HARMONICS}, max: {MAX_HARMONICS})")
-    parser.add_argument("--frame-size", "-f", type=int, default=DEFAULT_FRAME_SIZE,
-                        metavar="S",
-                        help=f"FFT frame size in samples (default: {DEFAULT_FRAME_SIZE})")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Print info for every frame")
+    parser.add_argument("--input",      "-i", required=True,
+                        help="Input .wav file")
+    parser.add_argument("--output",     "-o", default=None,
+                        help="Output .rsc file (defaults to input name with .rsc)")
+    parser.add_argument("--partials",   "-n", type=int, default=DEFAULT_PARTIALS,
+                        help="Number of sine partials per frame (8–64 recommended)")
+    parser.add_argument("--samplerate", "-r", type=int, default=DEFAULT_SAMPLERATE,
+                        choices=[22050, 44100],
+                        help="Target sample rate (22050 or 44100)")
 
     args = parser.parse_args()
 
-    if args.harmonics > MAX_HARMONICS:
-        print(f"Warning: harmonics capped at {MAX_HARMONICS}")
-        args.harmonics = MAX_HARMONICS
-
-    if args.frame_size < 64 or (args.frame_size & (args.frame_size - 1)) != 0:
-        print("Error: --frame-size must be a power of 2 and ≥ 64")
-        sys.exit(1)
+    output = args.output
+    if output is None:
+        base = args.input
+        if base.lower().endswith(".wav"):
+            base = base[:-4]
+        output = base + RSC_EXTENSION
 
     encode(
-        input_path   = args.input,
-        output_path  = args.output,
-        max_harmonics= args.harmonics,
-        frame_size   = args.frame_size,
-        verbose      = args.verbose,
+        input_path=args.input,
+        output_path=output,
+        n_partials=args.partials,
+        target_sample_rate=args.samplerate,
     )
 
 
