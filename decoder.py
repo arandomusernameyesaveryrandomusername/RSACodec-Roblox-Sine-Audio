@@ -90,49 +90,66 @@ def synthesize_with_phase_accum(
     sample_rate: int,
 ) -> np.ndarray:
     """
-    Reconstruct all frames with phase-continuous additive synthesis.
+    Reconstruct all frames with index-keyed phase-continuous synthesis.
 
-    Track running phase per frequency so each frame starts exactly
-    where the last one left off:  φ_next = φ_prev + 2π·f·frame_size/sr
-    Only frequencies active in the current frame are synthesized —
-    no bleed from previous frames.
+    WHY INDEX-KEYED (not frequency-keyed):
+    The previous approach stored phase_state[freq] — a dict keyed by the
+    float frequency value.  Even with peak tracking, a partial can shift
+    slightly between frames (440.00 → 432.00) due to FFT bin quantisation.
+    When that happens, phase_state.get(432.00) misses the 440.00 entry and
+    falls back to the raw FFT phase → discontinuity → click.
+
+    Keying by SLOT INDEX solves this completely.  The encoder's tracker
+    already ensures that slot 0 in frame N+1 is the continuation of slot 0
+    in frame N (closest matched partial).  So we just say:
+        "slot 0 this frame continues from where slot 0 left off"
+    regardless of whether its frequency drifted by 8 Hz.  The oscillator
+    glides smoothly and the phase is never reset mid-stream.
     """
-    n_frames  = len(frames)
-    total_len = frame_size * n_frames
-    output    = np.zeros(total_len, dtype=np.float64)
+    n_frames   = len(frames)
+    n_partials = max(len(f) for f in frames)
+    total_len  = frame_size * n_frames
+    output     = np.zeros(total_len, dtype=np.float64)
 
-    # phase_state: freq → phase at start of upcoming frame
-    phase_state: dict[float, float] = {}
+    # phase_state[slot] = phase at start of next frame
+    # amp_state[slot]   = amplitude at end of last frame (for ramp)
+    phase_state = [0.0] * n_partials
+    amp_state   = [0.0] * n_partials
+    first_frame = True
 
-    t = np.arange(frame_size, dtype=np.float64) / sample_rate
+    t        = np.arange(frame_size, dtype=np.float64) / sample_rate
+    ramp_end = np.linspace(0.0, 1.0, frame_size)   # weight towards new amp
+    ramp_beg = 1.0 - ramp_end                        # weight towards prev amp
 
     for i, partials in enumerate(frames):
         start        = i * frame_size
         frame_signal = np.zeros(frame_size, dtype=np.float64)
-        next_phase: dict[float, float] = {}
 
-        for (freq, amp_log, phase_fft) in partials:
-            if amp_log < 1e-6 or freq < 1e-3:
+        for slot, (freq, amp, phase_fft) in enumerate(partials):
+            amp_prev = amp_state[slot]
+
+            if amp < 1e-6 and amp_prev < 1e-6:
+                # Fully silent — just keep phase ticking
+                phase_state[slot] = (
+                    phase_state[slot] + TWO_PI * freq * frame_size / sample_rate
+                ) % TWO_PI
+                amp_state[slot] = 0.0
                 continue
 
-            # ── Invert logarithmic magnitude encoding ─────────────────────
-            # Encoder stored:  amp_log = log2(1 + amp * 1023) / 10
-            # Invert:          amp     = (2^(amp_log * 10) - 1) / 1023
-            BITS  = 10
-            SCALE = (2 ** BITS) - 1        # 1023
-            amp   = (2.0 ** (amp_log * BITS) - 1.0) / SCALE
+            phi0 = phase_fft if first_frame else phase_state[slot]
 
-            # Use tracked phase if we have one, else seed from FFT phase
-            phi0 = phase_state.get(freq, phase_fft)
+            # Ramp amplitude from prev frame's value to this frame's value.
+            # Eliminates the hard step at the frame boundary that causes ticks.
+            amp_env = amp_prev * ramp_beg + amp * ramp_end
 
-            frame_signal += amp * np.sin(TWO_PI * freq * t + phi0)
+            frame_signal += amp_env * np.sin(TWO_PI * freq * t + phi0)
 
-            # Advance phase to end of frame for continuity into next frame
-            next_phase[freq] = (phi0 + TWO_PI * freq * frame_size / sample_rate) % TWO_PI
+            phase_state[slot] = (
+                phi0 + TWO_PI * freq * frame_size / sample_rate
+            ) % TWO_PI
+            amp_state[slot] = amp
 
-        # Only carry forward frequencies still active this frame
-        phase_state = next_phase
-
+        first_frame = False
         output[start : start + frame_size] = frame_signal
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
