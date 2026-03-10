@@ -22,7 +22,7 @@ from scipy.signal import find_peaks
 #  Constants
 # ─────────────────────────────────────────────
 TARGET_FPS        = 60
-DEFAULT_PARTIALS  = 16
+DEFAULT_PARTIALS  = 64
 DEFAULT_SAMPLERATE = 44100
 RSC_MAGIC         = "RSC1"          # File header magic string
 RSC_EXTENSION     = ".rsc"
@@ -161,64 +161,62 @@ def _fft_candidates(
     return candidates
 
 
-def _track_peaks(
+# ─────────────────────────────────────────────
+#  Greedy Peak Tracker
+# ─────────────────────────────────────────────
+
+def _track_greedy(
     candidates: list[tuple[float, float, float]],
-    prev_partials: list[tuple[float, float, float]],
+    slots: list[tuple[float, float, float] | None],
     n_partials: int,
-    track_tolerance_hz: float = 50.0,
+    tolerance_hz: float = 50.0,
 ) -> list[tuple[float, float, float]]:
     """
-    Match FFT candidates to previous-frame partials by nearest frequency.
+    Greedy nearest-neighbour slot-stable peak tracking.
 
-    Why this matters:
-    Raw FFT peaks jitter frame-to-frame — a 440 Hz tone might read as
-    437 Hz one frame and 443 Hz the next just from window phase differences.
-    That jitter causes the decoder's phase accumulator to drift, producing
-    subtle but audible beating/warbling artefacts.
+    SLOT STABILITY IS CRITICAL FOR THE DECODER:
+    The decoder indexes its phasor oscillators by slot position.
+    Slot 0 in frame N+1 must be the same physical partial as slot 0
+    in frame N — otherwise the phase accumulator jumps to a wrong
+    value and produces a click.
 
-    Algorithm (greedy nearest-neighbour):
-      For each previous partial, find the closest unmatched candidate
-      within track_tolerance_hz.  If found → keep the CANDIDATE's
-      amplitude and phase (fresh data) but record it as a continuation.
-      Unmatched candidates are new births; unmatched prev partials died.
-
-    The final N partials are chosen by amplitude from:
-      continuations + new births (deaths are simply dropped).
+    Algorithm:
+      For each occupied slot (sorted by amplitude, loudest first so
+      strong partials get priority in contested matches):
+        - Find the closest unmatched candidate within tolerance_hz.
+        - If found  → fill same slot with that candidate (continuation).
+        - If not found → slot goes silent (0,0,0) this frame.
+      Leftover candidates are new births; assign them into empty/silent
+      slots, loudest first.
+      Any still-empty slots are padded with (0,0,0).
     """
-    import copy
+    remaining   = list(enumerate(candidates))   # (original_idx, (f,a,p))
+    result      = [(0.0, 0.0, 0.0)] * n_partials
 
-    remaining = list(candidates)   # candidates not yet claimed
-    tracked: list[tuple[float, float, float]] = []
+    # Sort occupied slots by amplitude descending so loudest get first pick
+    occupied = sorted(
+        [(s, slots[s]) for s in range(n_partials) if slots[s] is not None],
+        key=lambda x: x[1][1], reverse=True
+    )
 
-    # Sort prev partials by amplitude so strongest get first pick
-    prev_sorted = sorted(prev_partials, key=lambda x: x[1], reverse=True)
-
-    for (pf, pa, pp) in prev_sorted:
+    for slot_idx, (pf, pa, pp) in occupied:
         if not remaining:
             break
-        # Find the closest candidate in frequency
-        dists  = [abs(cf - pf) for (cf, ca, cp) in remaining]
+        dists  = [abs(cand[1][0] - pf) for cand in remaining]
         best_i = int(np.argmin(dists))
-        if dists[best_i] <= track_tolerance_hz:
-            cf, ca, cp = remaining.pop(best_i)
-            tracked.append((cf, ca, cp))   # matched continuation
+        if dists[best_i] <= tolerance_hz:
+            _, (cf, ca, cp) = remaining.pop(best_i)
+            result[slot_idx] = (round(cf, 2), round(ca, 3), round(cp, 4))
+        # else: slot stays (0,0,0) — partial died
 
-    # Any leftover candidates are new births
-    all_peaks = tracked + remaining
+    # Assign births into empty slots, loudest candidate first
+    remaining.sort(key=lambda x: x[1][1], reverse=True)
+    empty_slots = [s for s in range(n_partials) if result[s] == (0.0, 0.0, 0.0)]
+    for slot_idx, (_, (cf, ca, cp)) in zip(empty_slots, remaining):
+        if ca > 1e-6 and cf > 1e-3:
+            result[slot_idx] = (round(cf, 2), round(ca, 3), round(cp, 4))
 
-    # Sort by amplitude, take top-N
-    all_peaks.sort(key=lambda x: x[1], reverse=True)
-    chosen = all_peaks[:n_partials]
-
-    # Quantise and pad
-    partials = [
-        (round(f, 2), round(a, 3), round(p, 4))
-        for (f, a, p) in chosen
-        if f > 1e-3 and a > 1e-6
-    ]
-    while len(partials) < n_partials:
-        partials.append((0.0, 0.0, 0.0))
-    return partials[:n_partials]
+    return result
 
 
 def analyse_frame(
@@ -230,19 +228,14 @@ def analyse_frame(
     analysis_win: int = ANALYSIS_WIN,
 ) -> list[tuple[float, float, float]]:
     """
-    Analyse one hop position and return tracked partials.
-
-    Steps:
-      1. Run wide-window FFT centred on `center` to get candidates
-         (fetch 4× as many candidates as partials needed so the tracker
-          has plenty to match against)
-      2. Track candidates against prev_partials to stabilise frequencies
-      3. Return top-N partials
+    Analyse one hop position and return slot-stable tracked partials.
     """
     candidates = _fft_candidates(
         audio, center, analysis_win, sample_rate, n_candidates=n_partials * 4
     )
-    return _track_peaks(candidates, prev_partials, n_partials)
+    # Convert prev_partials to slot state (None for silent slots)
+    slots = [p if p[1] > 1e-6 else None for p in prev_partials]
+    return _track_greedy(candidates, slots, n_partials)
 
 
 # ─────────────────────────────────────────────
@@ -355,7 +348,7 @@ def encode(
           f"{sample_rate/ANALYSIS_WIN:.1f} Hz/bin)")
 
     all_frames: list[list[tuple[float, float, float]]] = []
-    prev_partials: list[tuple[float, float, float]] = []
+    prev_partials: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)] * n_partials
 
     for i in range(n_frames):
         # Centre of this hop in the full audio array

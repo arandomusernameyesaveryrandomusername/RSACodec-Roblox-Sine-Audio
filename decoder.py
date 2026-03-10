@@ -90,116 +90,85 @@ def synthesize_with_phase_accum(
     sample_rate: int,
 ) -> np.ndarray:
     """
-    Reconstruct all frames with index-keyed phase-continuous synthesis.
+    Slot-indexed, phasor-based, phase-continuous additive synthesis.
 
-    WHY INDEX-KEYED (not frequency-keyed):
-    The previous approach stored phase_state[freq] — a dict keyed by the
-    float frequency value.  Even with peak tracking, a partial can shift
-    slightly between frames (440.00 → 432.00) due to FFT bin quantisation.
-    When that happens, phase_state.get(432.00) misses the 440.00 entry and
-    falls back to the raw FFT phase → discontinuity → click.
+    WHY SLOT-INDEXED (not frequency-keyed):
+    ─────────────────────────────────────────
+    Keying phase state by frequency (a float) breaks whenever a tracked
+    partial drifts even one bin (440.0 → 432.0).  The lookup misses,
+    falls back to raw FFT phase, and produces a click.
 
-    Keying by SLOT INDEX solves this completely.  The encoder's tracker
-    already ensures that slot 0 in frame N+1 is the continuation of slot 0
-    in frame N (closest matched partial).  So we just say:
-        "slot 0 this frame continues from where slot 0 left off"
-    regardless of whether its frequency drifted by 8 Hz.  The oscillator
-    glides smoothly and the phase is never reset mid-stream.
+    Keying by SLOT INDEX is correct because the encoder's tracker already
+    guarantees: slot K in frame N+1 is the nearest-frequency continuation
+    of slot K in frame N.  We never need to look up by frequency — we just
+    say "slot K continues from where slot K left off", regardless of drift.
+
+    BIRTH DETECTION:
+    ─────────────────────────────────────────
+    A slot that was silent last frame (amp_prev < 1e-6) is a new birth.
+    We seed its phasor from the FFT-extracted phase so it starts in-phase
+    with the actual signal.  Every other frame it glides continuously.
+    The previous code only seeded on `first_frame` — births mid-stream
+    inherited stale phasor state from the last occupant of that slot,
+    causing a phase discontinuity and an audible click.
+
+    PHASOR ROTATION (no per-sample sin calls):
+    ─────────────────────────────────────────
+    Instead of computing amp * sin(2π·f·k/SR + φ) for each sample k,
+    we maintain a complex unit-circle phasor z and rotate it by
+    e^(i·θ) each step (θ = 2π·f/SR).  np.cumprod does the whole frame
+    in one vectorised pass.  sin/cos are called exactly twice per partial
+    per frame regardless of frame_size.
     """
     n_frames   = len(frames)
     n_partials = max(len(f) for f in frames)
     total_len  = frame_size * n_frames
     output     = np.zeros(total_len, dtype=np.float64)
 
-    # Phasor state per slot — stored as complex numbers on the unit circle.
-    # phasor_state[slot] = complex(cos(phi), sin(phi)) at start of next frame.
-    # amp_state[slot]    = amplitude at end of last frame (for ramp).
-    #
-    # WHY PHASOR / ROTATING VECTOR:
-    # The naive approach calls sin() for every sample:
-    #     signal[k] = amp * sin(2π·f·k/SR + φ)   ← sin() called frame_size times
-    #
-    # Instead we treat the oscillator as a point on the unit circle.
-    # One rotation step = multiply by the unit-phasor e^(i·θ):
-    #     z[k+1] = z[k] * (cos_θ + i·sin_θ)
-    #     output  = Im(z[k]) = sin component, Re(z[k]) = cos component
-    #
-    # This replaces thousands of sin() calls with complex multiplications,
-    # which are 4 real multiplies + 2 adds — much cheaper on any CPU.
-    # sin() / cos() are called exactly ONCE per active partial per frame
-    # (to compute the rotation step cos_θ, sin_θ) regardless of frame_size.
-    #
-    # NumPy implementation: fill a complex array with the rotation factor,
-    # set element[0] to the initial phasor, then np.cumprod() rotates it
-    # through all frame_size positions in one vectorised pass.
-    phasor_state = [complex(1.0, 0.0)] * n_partials   # unit phasor, phase=0
-    amp_state    = [0.0]              * n_partials
-    first_frame  = True
-
-    ramp_end = np.linspace(0.0, 1.0, frame_size)
-    ramp_beg = 1.0 - ramp_end
+    # phasor_state[slot] = complex point on unit circle, phase at frame start
+    # amp_state[slot]    = amplitude used last frame (0.0 = slot was silent)
+    phasor_state = [complex(1.0, 0.0)] * n_partials
+    amp_state    = [0.0]               * n_partials
 
     for i, partials in enumerate(frames):
         start        = i * frame_size
         frame_signal = np.zeros(frame_size, dtype=np.float64)
 
         for slot, (freq, amp, phase_fft) in enumerate(partials):
-            amp_prev = amp_state[slot]
-
-            if amp < 1e-6 and amp_prev < 1e-6:
-                # Silent — advance phasor so it stays ready for re-entry
-                theta       = TWO_PI * freq / sample_rate
-                rot         = complex(math.cos(theta), math.sin(theta))
-                # Raise rotation to frame_size power = advance by whole frame
-                # Use De Moivre: rotate by frame_size * theta in one shot
-                skip_angle  = theta * frame_size
-                phasor_state[slot] = phasor_state[slot] * complex(
-                    math.cos(skip_angle), math.sin(skip_angle)
-                )
+            if amp < 1e-6 or freq < 1e-3:
                 amp_state[slot] = 0.0
                 continue
 
-            # Compute the per-sample rotation factor — only TWO trig calls
-            # regardless of how many samples are in the frame.
-            theta   = TWO_PI * freq / sample_rate
-            cos_t   = math.cos(theta)
-            sin_t   = math.sin(theta)
-            rot     = complex(cos_t, sin_t)   # e^(i·θ)
+            amp_prev = amp_state[slot]
 
-            # Seed initial phasor from FFT phase on first frame,
-            # otherwise continue from stored state (phase-continuous).
-            if first_frame:
-                phi0   = phase_fft
-                z0     = complex(math.cos(phi0), math.sin(phi0))
+            # Per-sample rotation factor — two trig calls per partial per frame
+            theta = TWO_PI * freq / sample_rate
+            rot   = complex(math.cos(theta), math.sin(theta))
+
+            # BIRTH: slot was silent → seed phasor from FFT phase.
+            # CONTINUATION: slot was active → glide from stored phasor.
+            if amp_prev < 1e-6:
+                phi0 = phase_fft
+                z0   = complex(math.cos(phi0), math.sin(phi0))
             else:
-                z0     = phasor_state[slot]
+                z0   = phasor_state[slot]
 
-            # Build phasor trajectory via np.cumprod:
-            #   phasors[0] = z0  (initial position)
-            #   phasors[k] = z0 * rot^k  (after k rotation steps)
-            # This is the entire frame's worth of sin/cos values at once,
-            # with no further trig calls.
-            phasors       = np.empty(frame_size, dtype=np.complex128)
-            phasors[0]    = z0
-            phasors[1:]   = rot          # fill rest with rotation factor
-            phasors       = np.cumprod(phasors)   # cumulative rotation
+            # Vectorised phasor rotation over entire frame via cumprod:
+            #   phasors[k] = z0 * rot^k  (unit circle walk)
+            phasors      = np.empty(frame_size, dtype=np.complex128)
+            phasors[0]   = z0
+            phasors[1:]  = rot
+            phasors      = np.cumprod(phasors)
 
-            # Imaginary part = sin, real part = cos
-            sine_wave = phasors.imag
+            frame_signal += amp * phasors.imag
 
-            # Amplitude ramp across frame to kill boundary ticks
-            amp_env = amp_prev * ramp_beg + amp * ramp_end
-
-            frame_signal += amp_env * sine_wave
-
-            # Store phasor at end of frame — avoids any phase drift
-            # from floating-point accumulation by re-normalising to unit circle
-            z_end              = phasors[-1] * rot      # one more step = end of frame
-            magnitude          = abs(z_end)
-            phasor_state[slot] = z_end / magnitude if magnitude > 1e-12 else z_end
+            # Advance one more step to get the phasor at the START of
+            # the next frame, then re-normalise to prevent float drift
+            z_end              = phasors[-1] * rot
+            mag                = abs(z_end)
+            phasor_state[slot] = z_end / mag if mag > 1e-12 else complex(1.0, 0.0)
             amp_state[slot]    = amp
 
-        first_frame = False
         output[start : start + frame_size] = frame_signal
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
