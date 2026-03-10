@@ -1,5 +1,11 @@
 Audio Codec 4 Roblox :P
 
+| Version | Supported          |
+| ------- | ------------------ |
+| 2   | :white_check_mark: |
+| 1   | :x:                |
+
+
 Vibe Coded
 
 install numpy and scipy
