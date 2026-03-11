@@ -13,20 +13,12 @@ import wave
 
 import numpy as np
 from scipy.signal import find_peaks
-try:
-    from numba import njit as _njit
-    _NUMBA = True
-except ImportError:
-    def _njit(**kw):
-        def decorator(fn): return fn
-        return decorator
-    _NUMBA = False
 
 
 # ─────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────
-TARGET_FPS         = 120
+TARGET_FPS         = 60
 DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
@@ -77,18 +69,13 @@ class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = np.blackman(analysis_win).astype(np.float32)
+        self.window    = np.hanning(analysis_win).astype(np.float32)
         self.win_scale = 2.0 / float(np.sum(self.window))
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
         self.min_dist  = max(1, int(20.0 / self.bin_width))
         self.nyquist   = sample_rate / 2.0
         self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
-        # Pre-allocated interpolation buffers — reused every frame, no heap alloc
-        # Sized to max possible candidates (n_partials * 6, set at encode time)
-        self._ibuf_f   = None   # set by encoder after n_cand is known
-        self._ibuf_a   = None
-        self._ibuf_p   = None
 
 
 # ─────────────────────────────────────────────
@@ -120,154 +107,76 @@ def _fft_candidates(
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
     phs   = np.angle(spec).astype(np.float32)
 
-    # Vectorized peak detection: O(n) numpy comparison beats find_peaks for speed
-    # A peak is any bin greater than both its neighbours AND above threshold
-    above  = mags > 1e-7
-    is_peak = (mags[1:-1] > mags[:-2]) & (mags[1:-1] > mags[2:]) & above[1:-1]
-    peak_idx = np.where(is_peak)[0] + 1   # +1 to correct for sliced offset
-
-    # Enforce minimum distance between peaks (same as find_peaks distance= param)
-    if state.min_dist > 1 and len(peak_idx) > 1:
-        # Walk through and suppress any peak within min_dist of a louder neighbour
-        keep = np.ones(len(peak_idx), dtype=bool)
-        for j in range(len(peak_idx)):
-            if not keep[j]: continue
-            for k in range(j + 1, len(peak_idx)):
-                if peak_idx[k] - peak_idx[j] >= state.min_dist: break
-                if mags[peak_idx[k]] > mags[peak_idx[j]]:
-                    keep[j] = False
-                else:
-                    keep[k] = False
-        peak_idx = peak_idx[keep]
-
+    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)
     if len(peak_idx) == 0:
         peak_idx = np.argpartition(mags, -min(n_candidates, len(mags)))[-n_candidates:]
 
-    # Top n_candidates by magnitude — argpartition is O(n) vs argsort O(n log n)
-    pk = mags[peak_idx]
-    if len(pk) > n_candidates:
-        top = peak_idx[np.argpartition(pk, -n_candidates)[-n_candidates:]]
-    else:
-        top = peak_idx
+    # Top n_candidates by magnitude
+    top = peak_idx[np.argsort(mags[peak_idx])[::-1][:n_candidates]]
 
-    # Quadratic peak interpolation — write into pre-allocated buffers (no heap alloc)
-    bw     = state.bin_width
-    n_bins = len(mags)
-    ntop   = len(top)
-    buf_f  = state._ibuf_f[:ntop]
-    buf_a  = state._ibuf_a[:ntop]
-    buf_p  = state._ibuf_p[:ntop]
+    # Vectorized frequency range filter
+    f    = state.freqs[top]
+    mask = (f >= 20.0) & (f <= state.nyquist - state.bin_width)
+    top  = top[mask]
 
-    for j, k in enumerate(top):
-        if 1 <= k < n_bins - 1:
-            alpha = float(mags[k - 1])
-            beta  = float(mags[k])
-            gamma = float(mags[k + 1])
-            denom = alpha - 2.0 * beta + gamma
-            dp    = 0.5 * (alpha - gamma) / denom if abs(denom) > 1e-12 else 0.0
-            buf_f[j] = float(state.freqs[k]) + dp * bw
-            buf_a[j] = beta - 0.25 * (alpha - gamma) * dp
-        else:
-            buf_f[j] = float(state.freqs[k])
-            buf_a[j] = float(mags[k])
-        buf_p[j] = float(phs[k])
-
-    np.clip(buf_a, 0.0, 1.0, out=buf_a)
-    mask = (buf_f[:ntop] >= 8.0) & (buf_f[:ntop] <= state.nyquist * 0.98)
-    return buf_f[:ntop][mask].copy(), buf_a[:ntop][mask].copy(), buf_p[:ntop][mask].copy()
+    return state.freqs[top], np.clip(mags[top], 0.0, 1.0), phs[top]
 
 
 # ─────────────────────────────────────────────
 #  Greedy Peak Tracker
 # ─────────────────────────────────────────────
-@_njit(nopython=True, cache=True)
-def _track_greedy_kernel(
-    cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
-    prev_f: np.ndarray, prev_a: np.ndarray,
-    n_partials: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Numba-compiled greedy nearest-frequency matching kernel.
-    """
-    out_f = np.zeros(n_partials, dtype=np.float32)
-    out_a = np.zeros(n_partials, dtype=np.float32)
-    out_p = np.zeros(n_partials, dtype=np.float32)
-    n_cand = len(cand_f)
-    if n_cand == 0:
-        return out_f, out_a, out_p
-
-    claimed = np.zeros(n_cand, dtype=np.bool_)
-
-    # Build active list sorted by amplitude descending
-    active_idx = np.where(prev_a > 1e-9)[0]
-    for i in range(1, len(active_idx)):
-        key = active_idx[i]
-        j   = i - 1
-        while j >= 0 and prev_a[active_idx[j]] < prev_a[key]:
-            active_idx[j + 1] = active_idx[j]
-            j -= 1
-        active_idx[j + 1] = key
-
-    for ii in range(len(active_idx)):
-        slot   = active_idx[ii]
-        base_rel = 0.04 * prev_f[slot]
-        amp_factor = 1.4 - 0.8 * prev_a[slot]
-        tol=max(8.0, base_rel * amp_factor)
-        best_i = -1
-        best_d = tol + 1.0
-        for ci in range(n_cand):
-            if claimed[ci]: continue
-            d = abs(cand_f[ci] - prev_f[slot])
-            if d < best_d:
-                best_d = d
-                best_i = ci
-        if best_i >= 0 and best_d <= tol:
-            out_f[slot] = cand_f[best_i]
-            out_a[slot] = cand_a[best_i]
-            out_p[slot] = cand_p[best_i]
-            claimed[best_i] = True
-
-    # Births → empty slots, loudest first
-    # Collect unclaimed, sort by amp desc
-    n_births = 0
-    birth_idx = np.empty(n_cand, dtype=np.int64)
-    for ci in range(n_cand):
-        if not claimed[ci] and cand_a[ci] > 1e-10:
-            birth_idx[n_births] = ci
-            n_births += 1
-    birth_idx = birth_idx[:n_births]
-    # Sort births by amplitude descending
-    for i in range(1, n_births):
-        key = birth_idx[i]
-        j   = i - 1
-        while j >= 0 and cand_a[birth_idx[j]] < cand_a[key]:
-            birth_idx[j + 1] = birth_idx[j]
-            j -= 1
-        birth_idx[j + 1] = key
-
-    # Voice stealing: sort slots by current amplitude ascending,
-    # then let loud new births overwrite the quietest current partials.
-    # Small hysteresis (0.005) prevents flip-flopping on near-equal partials.
-    slot_order = np.argsort(out_a)   # quietest slot first
-    bi = 0
-    for si in range(n_partials):
-        if bi >= n_births: break
-        slot = slot_order[si]
-        if cand_a[birth_idx[bi]] > out_a[slot] + 0.005:
-            out_f[slot] = cand_f[birth_idx[bi]]
-            out_a[slot] = cand_a[birth_idx[bi]]
-            out_p[slot] = cand_p[birth_idx[bi]]
-            bi += 1
-
-    return out_f, out_a, out_p
-
-
 def _track_greedy(
     cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
     prev_f: np.ndarray, prev_a: np.ndarray,
     n_partials: int,
+    tol: float = 50.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    return _track_greedy_kernel(cand_f, cand_a, cand_p, prev_f, prev_a, n_partials)
+    """
+    Slot-stable greedy nearest-frequency matching.
+
+    All distance computations are vectorized numpy ops (no Python loops over
+    candidates). The outer slot loop (n_partials iterations) is unavoidable
+    for greedy correctness, but each iteration is a single np.argmin call.
+    At 384 partials this is ~50× faster than the list-pop version.
+    """
+    out_f = np.zeros(n_partials, dtype=np.float32)
+    out_a = np.zeros(n_partials, dtype=np.float32)
+    out_p = np.zeros(n_partials, dtype=np.float32)
+
+    if len(cand_f) == 0:
+        return out_f, out_a, out_p
+
+    claimed = np.zeros(len(cand_f), dtype=bool)
+
+    # Process occupied slots loudest-first
+    active  = np.where(prev_a > 1e-6)[0]
+    active  = active[np.argsort(prev_a[active])[::-1]]
+
+    for slot in active:
+        if claimed.all(): break
+        dists = np.where(~claimed, np.abs(cand_f - prev_f[slot]), np.inf)
+        bi    = int(np.argmin(dists))
+        if dists[bi] <= tol:
+            out_f[slot] = cand_f[bi]
+            out_a[slot] = cand_a[bi]
+            out_p[slot] = cand_p[bi]
+            claimed[bi] = True
+
+    # New births → empty slots, loudest first
+    births     = np.where(~claimed)[0]
+    if len(births):
+        births     = births[np.argsort(cand_a[births])[::-1]]
+        empty      = np.where(out_a == 0)[0]
+        n_assign   = min(len(births), len(empty))
+        bi_valid   = births[:n_assign]
+        mask       = (cand_a[bi_valid] > 1e-6) & (cand_f[bi_valid] > 1e-3)
+        sl         = empty[:n_assign][mask]
+        bi_v       = bi_valid[mask]
+        out_f[sl]  = cand_f[bi_v]
+        out_a[sl]  = cand_a[bi_v]
+        out_p[sl]  = cand_p[bi_v]
+
+    return out_f, out_a, out_p
 
 
 # ─────────────────────────────────────────────
@@ -280,6 +189,15 @@ def write_rsc(
     frame_phases: np.ndarray,   # (n_frames, n_partials) float32
     sample_rate: int, frame_size: int, total_samples: int,
 ) -> None:
+    """
+    Quantize and pack the entire frame array in one numpy pass.
+
+    Instead of n_frames × n_partials calls to struct.pack_into, we:
+      1. Quantize all three arrays at once with numpy broadcasting
+      2. View uint16 freq as two uint8 bytes (little-endian already on x86)
+      3. np.concatenate into (n_frames, n_partials, 4) uint8 array
+      4. One .tobytes() call writes the entire payload
+    """
     n_frames, n_partials = frame_freqs.shape
     HEADER = 23
 
@@ -291,9 +209,10 @@ def write_rsc(
 
     freq_scale = 65535.0 / (sample_rate / 2.0)
     f16 = np.clip(np.round(frame_freqs  * freq_scale),        0, 65535).astype(np.uint16)
-    a8  = np.clip(np.round(np.sqrt(frame_amps) * 255.0),       0,   255).astype(np.uint8)
+    a8  = np.clip(np.round(frame_amps   * 255.0),              0,   255).astype(np.uint8)
     p8  = np.clip(np.round(frame_phases / math.pi * 127.0), -128,   127).astype(np.int8)
 
+    # f16 uint16 → two uint8 bytes LE (natural on little-endian; safe everywhere via view)
     f_bytes = f16.view(np.uint8).reshape(n_frames, n_partials, 2)
     a_bytes = a8.reshape(n_frames, n_partials, 1)
     p_bytes = p8.view(np.uint8).reshape(n_frames, n_partials, 1)
@@ -339,13 +258,10 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
           f"  |  {n_frames} frames")
 
     state  = AnalysisState(sample_rate)
-    n_cand = n_partials * 6
-    # Initialise pre-alloc interp buffers now that n_cand is known
-    state._ibuf_f = np.empty(n_cand, dtype=np.float32)
-    state._ibuf_a = np.empty(n_cand, dtype=np.float32)
-    state._ibuf_p = np.empty(n_cand, dtype=np.float32)
+    n_cand = n_partials * 4
     print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)")
 
+    # Pre-allocate output matrices — no per-frame list creation
     all_f = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_p = np.zeros((n_frames, n_partials), dtype=np.float32)
@@ -353,12 +269,10 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
     prev_f = np.zeros(n_partials, dtype=np.float32)
     prev_a = np.zeros(n_partials, dtype=np.float32)
 
-    if _NUMBA:
-        print("   🔥 Numba JIT warm-up (first frame only) …")
     for i in range(n_frames):
         center = i * frame_size + frame_size // 2
-        cf, ca, cp = _fft_candidates(samples, center, state, n_cand)
-        of, oa, op = _track_greedy(cf, ca, cp, prev_f, prev_a, n_partials)
+        cf, ca, cp         = _fft_candidates(samples, center, state, n_cand)
+        of, oa, op         = _track_greedy(cf, ca, cp, prev_f, prev_a, n_partials)
         all_f[i] = of;  all_a[i] = oa;  all_p[i] = op
         prev_f = of;    prev_a = oa
 
