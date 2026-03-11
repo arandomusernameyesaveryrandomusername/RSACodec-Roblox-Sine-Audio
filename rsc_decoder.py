@@ -1,9 +1,8 @@
 """
-rsc_encoder.py — Roblox Sine Codec (RSC) Encoder  [optimized]
+rsc_decoder.py — Roblox Sine Codec (RSC) Decoder  [optimized]
 
 Usage:
-    python rsc_encoder.py --input audio.wav --output audio.rsc
-    python rsc_encoder.py --input audio.wav --output audio.rsc --partials 384 --samplerate 44100
+    python rsc_decoder.py --input audio.rsc --output decoded.wav
 """
 
 import argparse
@@ -12,392 +11,194 @@ import struct
 import wave
 
 import numpy as np
-from scipy.signal import find_peaks
-try:
-    from numba import njit as _njit
-    _NUMBA = True
-except ImportError:
-    def _njit(**kw):
-        def decorator(fn): return fn
-        return decorator
-    _NUMBA = False
+
+TWO_PI = 2.0 * math.pi
 
 
 # ─────────────────────────────────────────────
-#  Constants
+#  RSC Binary Reader  (fully vectorized)
 # ─────────────────────────────────────────────
-TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 384
-DEFAULT_SAMPLERATE = 44100
-RSC_EXTENSION      = ".rsc"
-ANALYSIS_WIN       = 4096     # ~10.8 Hz/bin at 44100
-
-
-# ─────────────────────────────────────────────
-#  WAV Loading
-# ─────────────────────────────────────────────
-def load_wav(path: str) -> tuple[np.ndarray, int]:
-    with wave.open(path, "rb") as wf:
-        n_channels  = wf.getnchannels()
-        sampwidth   = wf.getsampwidth()
-        sample_rate = wf.getframerate()
-        raw         = wf.readframes(wf.getnframes())
-
-    if sampwidth == 1:
-        s = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
-    elif sampwidth == 2:
-        s = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    elif sampwidth == 3:
-        b = np.frombuffer(raw, dtype=np.uint8)
-        i = (b[0::3].astype(np.int32) | (b[1::3].astype(np.int32) << 8) |
-             (b[2::3].astype(np.int32) << 16))
-        i[i >= 0x800000] -= 0x1000000
-        s = i.astype(np.float32) / 8388608.0
-    elif sampwidth == 4:
-        s = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
-    else:
-        raise ValueError(f"Unsupported sample width: {sampwidth}")
-
-    if n_channels > 1:
-        s = s.reshape(-1, n_channels).mean(axis=1)
-    peak = np.max(np.abs(s))
-    if peak > 1e-9: s /= peak
-    return s, sample_rate
-
-
-# ─────────────────────────────────────────────
-#  Analysis State  (precomputed ONCE per run)
-# ─────────────────────────────────────────────
-class AnalysisState:
+def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Precomputes all FFT constants so _fft_candidates() is pure computation.
-    Previously np.hanning(4096) and rfftfreq(4096) were called every frame —
-    at 3600 frames/min that's 7200 wasted allocations.
+    Read the binary .rsc file and return decoded frame arrays.
+
+    Instead of a double Python loop calling struct.unpack_from per field,
+    we read the entire body with np.frombuffer into a structured dtype and
+    convert in bulk — one operation regardless of file size.
+
+    Returns:
+        metadata   dict
+        freqs      float32 array  (n_frames, n_partials)  Hz
+        amps       float32 array  (n_frames, n_partials)  0–1
+        phases     float32 array  (n_frames, n_partials)  radians
     """
-    def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
-        self.win       = analysis_win
-        self.sr        = sample_rate
-        self.window    = np.blackman(analysis_win).astype(np.float32)
-        self.win_scale = 2.0 / float(np.sum(self.window))
-        self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
-        self.bin_width = float(sample_rate) / analysis_win
-        self.min_dist  = max(1, int(20.0 / self.bin_width))
-        self.nyquist   = sample_rate / 2.0
-        self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
-        # Pre-allocated interpolation buffers — reused every frame, no heap alloc
-        # Sized to max possible candidates (n_partials * 6, set at encode time)
-        self._ibuf_f   = None   # set by encoder after n_cand is known
-        self._ibuf_a   = None
-        self._ibuf_p   = None
+    with open(path, "rb") as f:
+        raw = f.read()
+
+    if len(raw) < 23:
+        raise ValueError("File too short to be a valid .rsc file.")
+
+    # ── Parse 22-byte header ──────────────────────────────────────────────
+    magic,         = struct.unpack_from("4s",  raw,  0)
+    version,       = struct.unpack_from("<B",  raw,  4)
+    sample_rate,   = struct.unpack_from("<I",  raw,  5)
+    frame_size,    = struct.unpack_from("<I",  raw,  9)
+    n_partials,    = struct.unpack_from("<H",  raw, 13)
+    total_samples, = struct.unpack_from("<I",  raw, 15)
+    total_frames,  = struct.unpack_from("<I",  raw, 19)
+
+    if magic != b"RSC2":
+        raise ValueError(f"Unknown magic: {magic!r}")
+
+    metadata = dict(magic=magic.decode(), version=version, sample_rate=sample_rate,
+                    frame_size=frame_size, n_partials=n_partials,
+                    total_samples=total_samples, total_frames=total_frames)
+
+    # ── Bulk decode frame data ────────────────────────────────────────────
+    # Layout per partial: uint16 freq | uint8 amp | int8 phase
+    # Read as structured dtype — one frombuffer call, zero Python loops.
+    # offset=23 (header is 23 bytes now: uint16 n_partials vs old uint8)
+    dtype  = np.dtype([("freq", "<u2"), ("amp", "u1"), ("phase", "i1")])
+    body   = np.frombuffer(raw, dtype=dtype, offset=23)             # (n_frames*n_partials,)
+    body   = body.reshape(total_frames, n_partials)
+
+    nyquist    = sample_rate / 2.0
+    freq_scale = nyquist / 65535.0
+
+    freqs  = (body["freq"].astype(np.float32) * freq_scale)         # Hz
+    amps   = (body["amp"].astype(np.float32)  / 255.0) ** 2        # sqrt-encoded → linear
+    phases = (body["phase"].astype(np.float32) / 127.0 * math.pi)  # -π..π
+
+    return metadata, freqs, amps, phases
 
 
 # ─────────────────────────────────────────────
-#  FFT Candidate Extraction
+#  Phase-Continuous Synthesis  (all-partial vectorized)
 # ─────────────────────────────────────────────
-def _fft_candidates(
-    audio: np.ndarray,
-    center: int,
-    state: AnalysisState,
-    n_candidates: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def synthesize(
+    freqs:      np.ndarray,   # (n_frames, n_partials) float32 Hz
+    amps:       np.ndarray,   # (n_frames, n_partials) float32
+    phases:     np.ndarray,   # (n_frames, n_partials) float32 radians
+    frame_size: int,
+    sample_rate: int,
+) -> np.ndarray:
     """
-    Returns (freqs, amps, phases) as float32 numpy arrays — no list boxing.
-    Uses a pre-allocated pad buffer so boundary frames don't heap-allocate.
+    Slot-indexed phase-continuous additive synthesis, fully vectorized.
+
+    Previous approach: Python loop over n_partials × np.cumprod per partial.
+    At 384 partials × 3600 frames that's 1.38M Python iterations.
+
+    New approach: process ALL active partials for a frame simultaneously.
+      t = [0, 1, ..., frame_size-1] / sample_rate              (frame_size,)
+      phi0 = phase state vector                                  (n_active,)
+      f    = frequency vector                                    (n_active,)
+      a    = amplitude vector                                    (n_active,)
+
+      signal = (a[:, None] * np.sin(TWO_PI * f[:, None] * t + phi0[:, None])).sum(axis=0)
+
+    That's one np.sin call on an (n_active × frame_size) matrix per frame.
+    numpy dispatches this to a BLAS-level loop — ~100× faster than 384
+    individual Python calls at 384 partials.
+
+    Phase state is carried forward exactly:
+      phi_next = (phi0 + TWO_PI * f * frame_size / sample_rate) % TWO_PI
+    Slots that are silent (amp < 1e-6) still advance their phase so they
+    re-enter in-sync if they become active again.
     """
-    half = state.win // 2
-    s, e = center - half, center + half
-    n    = len(audio)
+    n_frames, n_partials = freqs.shape
+    total_len = frame_size * n_frames
+    output    = np.zeros(total_len, dtype=np.float64)
 
-    if s < 0 or e > n:
-        chunk = state.pad_buf.copy()
-        ss, se = max(0, s), min(n, e)
-        chunk[ss - s : ss - s + (se - ss)] = audio[ss:se]
-    else:
-        chunk = audio[s:e]
+    # t is reused every frame
+    t = np.arange(frame_size, dtype=np.float64) / sample_rate  # (frame_size,)
 
-    # float64 for FFT numerical accuracy, then back to float32
-    spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
-    mags  = np.abs(spec).astype(np.float32) * state.win_scale
-    phs   = np.angle(spec).astype(np.float32)
+    # Phase state — float64 for accumulation precision
+    phi = np.zeros(n_partials, dtype=np.float64)
+    # Track which slots were active last frame for birth detection
+    prev_active = np.zeros(n_partials, dtype=bool)
 
-    # Vectorized peak detection: O(n) numpy comparison beats find_peaks for speed
-    # A peak is any bin greater than both its neighbours AND above threshold
-    above  = mags > 1e-7
-    is_peak = (mags[1:-1] > mags[:-2]) & (mags[1:-1] > mags[2:]) & above[1:-1]
-    peak_idx = np.where(is_peak)[0] + 1   # +1 to correct for sliced offset
-
-    # Enforce minimum distance between peaks (same as find_peaks distance= param)
-    if state.min_dist > 1 and len(peak_idx) > 1:
-        # Walk through and suppress any peak within min_dist of a louder neighbour
-        keep = np.ones(len(peak_idx), dtype=bool)
-        for j in range(len(peak_idx)):
-            if not keep[j]: continue
-            for k in range(j + 1, len(peak_idx)):
-                if peak_idx[k] - peak_idx[j] >= state.min_dist: break
-                if mags[peak_idx[k]] > mags[peak_idx[j]]:
-                    keep[j] = False
-                else:
-                    keep[k] = False
-        peak_idx = peak_idx[keep]
-
-    if len(peak_idx) == 0:
-        peak_idx = np.argpartition(mags, -min(n_candidates, len(mags)))[-n_candidates:]
-
-    # Top n_candidates by magnitude — argpartition is O(n) vs argsort O(n log n)
-    pk = mags[peak_idx]
-    if len(pk) > n_candidates:
-        top = peak_idx[np.argpartition(pk, -n_candidates)[-n_candidates:]]
-    else:
-        top = peak_idx
-
-    # Quadratic peak interpolation — write into pre-allocated buffers (no heap alloc)
-    bw     = state.bin_width
-    n_bins = len(mags)
-    ntop   = len(top)
-    buf_f  = state._ibuf_f[:ntop]
-    buf_a  = state._ibuf_a[:ntop]
-    buf_p  = state._ibuf_p[:ntop]
-
-    for j, k in enumerate(top):
-        if 1 <= k < n_bins - 1:
-            alpha = float(mags[k - 1])
-            beta  = float(mags[k])
-            gamma = float(mags[k + 1])
-            denom = alpha - 2.0 * beta + gamma
-            dp    = 0.5 * (alpha - gamma) / denom if abs(denom) > 1e-12 else 0.0
-            buf_f[j] = float(state.freqs[k]) + dp * bw
-            buf_a[j] = beta - 0.25 * (alpha - gamma) * dp
-        else:
-            buf_f[j] = float(state.freqs[k])
-            buf_a[j] = float(mags[k])
-        buf_p[j] = float(phs[k])
-
-    np.clip(buf_a, 0.0, 1.0, out=buf_a)
-    mask = (buf_f[:ntop] >= 8.0) & (buf_f[:ntop] <= state.nyquist * 0.98)
-    return buf_f[:ntop][mask].copy(), buf_a[:ntop][mask].copy(), buf_p[:ntop][mask].copy()
-
-
-# ─────────────────────────────────────────────
-#  Greedy Peak Tracker
-# ─────────────────────────────────────────────
-@_njit(nopython=True, cache=True)
-def _track_greedy_kernel(
-    cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
-    prev_f: np.ndarray, prev_a: np.ndarray, freq_vel: np.ndarray,
-    n_partials: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Numba-compiled greedy tracker with linear-prediction continuation.
-
-    Instead of nearest-neighbour distance from prev_f, each slot predicts
-    its next frequency using velocity (per-frame delta from last two frames):
-
-        predicted_f = prev_f[slot] + freq_vel[slot]
-
-    The candidate closest to that prediction wins — no hard tol cutoff.
-    This handles vibrato, portamento, and fast-moving partials that a fixed
-    50/120 Hz window would reject or mis-assign.
-    """
-    out_f = np.zeros(n_partials, dtype=np.float32)
-    out_a = np.zeros(n_partials, dtype=np.float32)
-    out_p = np.zeros(n_partials, dtype=np.float32)
-    n_cand = len(cand_f)
-    if n_cand == 0:
-        return out_f, out_a, out_p
-
-    claimed = np.zeros(n_cand, dtype=np.bool_)
-
-    # Build active list sorted by amplitude descending
-    active_idx = np.where(prev_a > 1e-9)[0]
-    for i in range(1, len(active_idx)):
-        key = active_idx[i]
-        j   = i - 1
-        while j >= 0 and prev_a[active_idx[j]] < prev_a[key]:
-            active_idx[j + 1] = active_idx[j]
-            j -= 1
-        active_idx[j + 1] = key
-
-    for ii in range(len(active_idx)):
-        slot      = active_idx[ii]
-        predicted = prev_f[slot] + freq_vel[slot]   # linear prediction
-        best_i    = -1
-        best_d    = 1e18
-        for ci in range(n_cand):
-            if claimed[ci]: continue
-            d = abs(cand_f[ci] - predicted)         # distance to prediction, not prev_f
-            if d < best_d:
-                best_d = d
-                best_i = ci
-        if best_i >= 0:                             # no tol check — just take nearest
-            out_f[slot] = cand_f[best_i]
-            out_a[slot] = cand_a[best_i]
-            out_p[slot] = cand_p[best_i]
-            claimed[best_i] = True
-
-    # Births → empty slots, loudest first
-    # Collect unclaimed, sort by amp desc
-    n_births = 0
-    birth_idx = np.empty(n_cand, dtype=np.int64)
-    for ci in range(n_cand):
-        if not claimed[ci] and cand_a[ci] > 1e-10:
-            birth_idx[n_births] = ci
-            n_births += 1
-    birth_idx = birth_idx[:n_births]
-    # Sort births by amplitude descending
-    for i in range(1, n_births):
-        key = birth_idx[i]
-        j   = i - 1
-        while j >= 0 and cand_a[birth_idx[j]] < cand_a[key]:
-            birth_idx[j + 1] = birth_idx[j]
-            j -= 1
-        birth_idx[j + 1] = key
-
-    # Voice stealing: sort slots by current amplitude ascending,
-    # then let loud new births overwrite the quietest current partials.
-    # Small hysteresis (0.005) prevents flip-flopping on near-equal partials.
-    slot_order = np.argsort(out_a)   # quietest slot first
-    bi = 0
-    for si in range(n_partials):
-        if bi >= n_births: break
-        slot = slot_order[si]
-        if cand_a[birth_idx[bi]] > out_a[slot] + 0.005:
-            out_f[slot] = cand_f[birth_idx[bi]]
-            out_a[slot] = cand_a[birth_idx[bi]]
-            out_p[slot] = cand_p[birth_idx[bi]]
-            bi += 1
-
-    return out_f, out_a, out_p
-
-
-def _track_greedy(
-    cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
-    prev_f: np.ndarray, prev_a: np.ndarray, freq_vel: np.ndarray,
-    n_partials: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    return _track_greedy_kernel(cand_f, cand_a, cand_p, prev_f, prev_a, freq_vel, n_partials)
-
-
-# ─────────────────────────────────────────────
-#  RSC Binary Writer  (fully vectorized)
-# ─────────────────────────────────────────────
-def write_rsc(
-    path: str,
-    frame_freqs:  np.ndarray,   # (n_frames, n_partials) float32
-    frame_amps:   np.ndarray,   # (n_frames, n_partials) float32
-    frame_phases: np.ndarray,   # (n_frames, n_partials) float32
-    sample_rate: int, frame_size: int, total_samples: int,
-) -> None:
-    n_frames, n_partials = frame_freqs.shape
-    HEADER = 23
-
-    buf = bytearray(HEADER + n_frames * n_partials * 4)
-    struct.pack_into("<4sBIIHII", buf, 0,
-                     b"RSC2", 2,
-                     sample_rate, frame_size, n_partials,
-                     total_samples, n_frames)
-
-    freq_scale = 65535.0 / (sample_rate / 2.0)
-    f16 = np.clip(np.round(frame_freqs  * freq_scale),        0, 65535).astype(np.uint16)
-    a8  = np.clip(np.round(np.sqrt(frame_amps) * 255.0),       0,   255).astype(np.uint8)
-    p8  = np.clip(np.round(frame_phases / math.pi * 127.0), -128,   127).astype(np.int8)
-
-    f_bytes = f16.view(np.uint8).reshape(n_frames, n_partials, 2)
-    a_bytes = a8.reshape(n_frames, n_partials, 1)
-    p_bytes = p8.view(np.uint8).reshape(n_frames, n_partials, 1)
-
-    buf[HEADER:] = np.concatenate([f_bytes, a_bytes, p_bytes], axis=2).tobytes()
-
-    with open(path, "wb") as fh:
-        fh.write(buf)
-
-    kb = len(buf) / 1024
-    print(f"  ✅ Wrote {n_frames} frames → {path}  ({kb:.1f} KB, {kb/60:.1f} KB/s)")
-
-
-# ─────────────────────────────────────────────
-#  Main Encode Pipeline
-# ─────────────────────────────────────────────
-def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -> None:
-    print(f"🎵 RSC Encoder  —  {input_path}")
-    print(f"   Partials/frame : {n_partials}  |  Target SR: {target_sr} Hz")
-
-    samples, native_sr = load_wav(input_path)
-    print(f"   Native SR      : {native_sr} Hz  |  {len(samples)} samples  "
-          f"({len(samples)/native_sr:.2f}s)")
-
-    if native_sr != target_sr:
-        print(f"   Resampling {native_sr} → {target_sr} Hz …")
-        from math import gcd
-        from scipy.signal import resample_poly
-        g = gcd(target_sr, native_sr)
-        samples = resample_poly(samples, target_sr // g, native_sr // g).astype(np.float32)
-        peak = np.max(np.abs(samples))
-        if peak > 1e-9: samples /= peak
-
-    sample_rate   = target_sr
-    total_samples = len(samples)
-    frame_size    = int(round(sample_rate / TARGET_FPS))
-    n_frames      = math.ceil(total_samples / frame_size)
-    pad            = n_frames * frame_size - total_samples
-    if pad > 0:
-        samples = np.concatenate([samples, np.zeros(pad, dtype=np.float32)])
-
-    print(f"   Frame size     : {frame_size} samp  ({1000*frame_size/sample_rate:.2f} ms)"
-          f"  |  {n_frames} frames")
-
-    state  = AnalysisState(sample_rate)
-    n_cand = n_partials * 6
-    # Initialise pre-alloc interp buffers now that n_cand is known
-    state._ibuf_f = np.empty(n_cand, dtype=np.float32)
-    state._ibuf_a = np.empty(n_cand, dtype=np.float32)
-    state._ibuf_p = np.empty(n_cand, dtype=np.float32)
-    print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)")
-
-    all_f = np.zeros((n_frames, n_partials), dtype=np.float32)
-    all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
-    all_p = np.zeros((n_frames, n_partials), dtype=np.float32)
-
-    prev_f    = np.zeros(n_partials, dtype=np.float32)
-    prev_a    = np.zeros(n_partials, dtype=np.float32)
-    freq_vel  = np.zeros(n_partials, dtype=np.float32)   # per-partial frequency velocity
-
-    if _NUMBA:
-        print("   🔥 Numba JIT warm-up (first frame only) …")
     for i in range(n_frames):
-        center = i * frame_size + frame_size // 2
-        cf, ca, cp = _fft_candidates(samples, center, state, n_cand)
-        of, oa, op = _track_greedy(cf, ca, cp, prev_f, prev_a, freq_vel, n_partials)
-        all_f[i] = of;  all_a[i] = oa;  all_p[i] = op
+        f = freqs[i].astype(np.float64)    # (n_partials,)
+        a = amps[i].astype(np.float64)     # (n_partials,)
+        p = phases[i].astype(np.float64)   # (n_partials,) — FFT phase, used only on birth
 
-        # Update velocity: only for slots active in both frames
-        active_both = (oa > 1e-9) & (prev_a > 1e-9)
-        freq_vel = np.where(active_both, of - prev_f, 0.0).astype(np.float32)
+        active = a > 1e-6
 
-        prev_f = of;    prev_a = oa
+        # Birth detection: slot newly active this frame → seed phase from FFT
+        births = active & ~prev_active
+        phi[births] = p[births]
+
+        if active.any():
+            fa  = f[active]       # (n_active,)
+            aa  = a[active]       # (n_active,)
+            pa  = phi[active]     # (n_active,)
+
+            # All partials × all samples in one broadcast sin call
+            # shape: (n_active, frame_size)
+            signal_matrix = aa[:, None] * np.sin(TWO_PI * fa[:, None] * t + pa[:, None])
+            output[i * frame_size : (i + 1) * frame_size] = signal_matrix.sum(axis=0)
+
+        # Advance phase for ALL slots (including silent — keeps them in sync)
+        phi = (phi + TWO_PI * f * frame_size / sample_rate) % TWO_PI
+
+        prev_active = active
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
-            print(f"   … encoded frame {i+1}/{n_frames}", end="\r")
+            print(f"   ... synthesized frame {i+1}/{n_frames}", end="\r")
 
     print()
-    write_rsc(output_path, all_f, all_a, all_p, sample_rate, frame_size, total_samples)
-    kb = (22 + n_frames * n_partials * 4) / 1024
-    print(f"   📦 {kb:.1f} KB  ({kb/1024:.3f} MB)  |  🎉 Done!")
+    return output.astype(np.float32)
+
+
+# ─────────────────────────────────────────────
+#  WAV Writer
+# ─────────────────────────────────────────────
+def write_wav(path: str, samples: np.ndarray, sample_rate: int) -> None:
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(1);  wf.setsampwidth(2);  wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+    print(f"  ✅ Wrote {len(samples)} samples ({len(samples)/sample_rate:.2f}s) → {path}")
+
+
+# ─────────────────────────────────────────────
+#  Main Decode Pipeline
+# ─────────────────────────────────────────────
+def decode(input_path: str, output_path: str,
+           override_sr: int | None, trim: bool) -> None:
+    print(f"🔊 RSC Decoder  —  {input_path}")
+
+    meta, freqs, amps, phases = parse_rsc(input_path)
+    sr         = override_sr or meta["sample_rate"]
+    frame_size = meta["frame_size"]
+    print(f"   {meta['total_frames']} frames  |  {meta['n_partials']} partials  "
+          f"|  {sr} Hz  |  {meta['total_samples']/sr:.2f}s")
+
+    output = synthesize(freqs, amps, phases, frame_size, sr)
+
+    if trim and meta.get("total_samples"):
+        output = output[:meta["total_samples"]]
+
+    peak = np.max(np.abs(output))
+    if peak > 1e-9: output /= peak
+
+    write_wav(output_path, output, sr)
+    print("   🎉 Decoding complete!")
 
 
 # ─────────────────────────────────────────────
 #  CLI
 # ─────────────────────────────────────────────
 def main():
-    p = argparse.ArgumentParser(description="RSC Encoder",
+    p = argparse.ArgumentParser(description="RSC Decoder",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--input",      "-i", required=True)
     p.add_argument("--output",     "-o", default=None)
-    p.add_argument("--partials",   "-n", type=int, default=DEFAULT_PARTIALS)
-    p.add_argument("--samplerate", "-r", type=int, default=DEFAULT_SAMPLERATE,
-                   choices=[22050, 44100])
+    p.add_argument("--samplerate", "-r", type=int, default=None, choices=[22050, 44100])
+    p.add_argument("--no-trim",         action="store_true")
     args = p.parse_args()
-    out  = args.output or (args.input.removesuffix(".wav") + RSC_EXTENSION)
-    encode(args.input, out, args.partials, args.samplerate)
+    out  = args.output or (args.input.removesuffix(".rsc") + "_decoded.wav")
+    decode(args.input, out, args.samplerate, not args.no_trim)
 
 if __name__ == "__main__":
     main()
