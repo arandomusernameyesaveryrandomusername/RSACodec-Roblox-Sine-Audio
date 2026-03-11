@@ -69,7 +69,7 @@ class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = np.hanning(analysis_win).astype(np.float32)
+        self.window    = np.blackman(analysis_win).astype(np.float32)
         self.win_scale = 2.0 / float(np.sum(self.window))
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
@@ -107,19 +107,41 @@ def _fft_candidates(
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
     phs   = np.angle(spec).astype(np.float32)
 
-    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)
+    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-7)
     if len(peak_idx) == 0:
         peak_idx = np.argpartition(mags, -min(n_candidates, len(mags)))[-n_candidates:]
 
     # Top n_candidates by magnitude
     top = peak_idx[np.argsort(mags[peak_idx])[::-1][:n_candidates]]
 
-    # Vectorized frequency range filter
-    f    = state.freqs[top]
-    mask = (f >= 20.0) & (f <= state.nyquist - state.bin_width)
-    top  = top[mask]
+    # Quadratic peak interpolation — 3-point parabola per peak.
+    # Real frequencies rarely sit exactly on FFT bins; this sub-bin correction
+    # eliminates pitch jitter with negligible cost (one loop over n_candidates).
+    interp_f, interp_a, interp_p = [], [], []
+    bw = state.bin_width
+    n_bins = len(mags)
+    for k in top:
+        if 1 <= k < n_bins - 1:
+            alpha = float(mags[k - 1])
+            beta  = float(mags[k])
+            gamma = float(mags[k + 1])
+            denom = alpha - 2.0 * beta + gamma
+            p     = 0.5 * (alpha - gamma) / denom if abs(denom) > 1e-12 else 0.0
+            freq  = float(state.freqs[k]) + p * bw
+            mag   = beta - 0.25 * (alpha - gamma) * p
+        else:
+            freq = float(state.freqs[k])
+            mag  = float(mags[k])
+        interp_f.append(freq)
+        interp_a.append(mag)
+        interp_p.append(float(phs[k]))
 
-    return state.freqs[top], np.clip(mags[top], 0.0, 1.0), phs[top]
+    f = np.array(interp_f, dtype=np.float32)
+    a = np.clip(np.array(interp_a, dtype=np.float32), 0.0, 1.0)
+    p = np.array(interp_p, dtype=np.float32)
+
+    mask = (f >= 20.0) & (f <= state.nyquist - state.bin_width)
+    return f[mask], a[mask], p[mask]
 
 
 # ─────────────────────────────────────────────
@@ -209,7 +231,7 @@ def write_rsc(
 
     freq_scale = 65535.0 / (sample_rate / 2.0)
     f16 = np.clip(np.round(frame_freqs  * freq_scale),        0, 65535).astype(np.uint16)
-    a8  = np.clip(np.round(frame_amps   * 255.0),              0,   255).astype(np.uint8)
+    a8  = np.clip(np.round(np.sqrt(frame_amps) * 255.0),       0,   255).astype(np.uint8)
     p8  = np.clip(np.round(frame_phases / math.pi * 127.0), -128,   127).astype(np.int8)
 
     # f16 uint16 → two uint8 bytes LE (natural on little-endian; safe everywhere via view)
@@ -258,7 +280,7 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
           f"  |  {n_frames} frames")
 
     state  = AnalysisState(sample_rate)
-    n_cand = n_partials * 4
+    n_cand = n_partials * 6
     print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)")
 
     # Pre-allocate output matrices — no per-frame list creation

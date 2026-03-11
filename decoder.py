@@ -66,7 +66,7 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     freq_scale = nyquist / 65535.0
 
     freqs  = (body["freq"].astype(np.float32) * freq_scale)         # Hz
-    amps   = (body["amp"].astype(np.float32)  / 255.0)              # 0–1
+    amps   = (body["amp"].astype(np.float32)  / 255.0) ** 2        # sqrt-encoded → linear
     phases = (body["phase"].astype(np.float32) / 127.0 * math.pi)  # -π..π
 
     return metadata, freqs, amps, phases
