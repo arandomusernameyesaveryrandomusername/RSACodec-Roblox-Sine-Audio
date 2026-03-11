@@ -26,10 +26,11 @@ FULL SETUP
    python3 -m venv venv
    source venv/bin/activate
 
-   (see (venv) prefix? Good proceed to next part! If not, make sure you created the venv properly by looking if theres a venv folder adn that you ran the right activate command look at your teminal carefully...)
+   (see (venv) prefix? Good proceed to next part! If not, make sure you created the venv properly by looking if theres a venv folder and that you ran the right activate command look at your teminal carefully...)
 
 4. Install the goods
-   pip install --upgrade pip
+   python -m pip install --upgrade pip
+   
    pip install numpy scipy
 
    Turbo mode (optional):
@@ -38,14 +39,15 @@ FULL SETUP
 5. Encode the audio 🔥
    python rsc_encoder.py
 
-   → slap your message in
-   → spits out a sneaky .wav
-   → upload to Roblox (6–20 seconds hits perfect)
+   → poot in
+   → spits out a .rsc
+   → make sure rsc link public
+   → client plays back owo
 
 To Decode:
    python rsc_decoder.py
 
-Just sine-wave wizardry 🎶🕵️‍♂️  
+Just sine-wave stuff  
 Audio goes in clean → comes out not so clean on the other side 💨
 
 Audio Codec 4 Roblox :P
