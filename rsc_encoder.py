@@ -173,8 +173,8 @@ def _fft_candidates(
         buf_p[j] = float(phs[k])
 
     np.clip(buf_a, 0.0, 1.0, out=buf_a)
-    mask = (buf_f >= 20.0) & (buf_f <= state.nyquist - bw)
-    return buf_f[mask].copy(), buf_a[mask].copy(), buf_p[mask].copy()
+    mask = (buf_f[:ntop] >= 8.0) & (buf_f[:ntop] <= state.nyquist * 0.98)
+    return buf_f[:ntop][mask].copy(), buf_a[:ntop][mask].copy(), buf_p[:ntop][mask].copy()
 
 
 # ─────────────────────────────────────────────
@@ -183,15 +183,20 @@ def _fft_candidates(
 @_njit(nopython=True, cache=True)
 def _track_greedy_kernel(
     cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
-    prev_f: np.ndarray, prev_a: np.ndarray,
+    prev_f: np.ndarray, prev_a: np.ndarray, freq_vel: np.ndarray,
     n_partials: int,
-    tol: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Numba-compiled greedy nearest-frequency matching kernel.
-    When numba is available this compiles to native code on first call
-    (warm-up ~1s) then runs 5-20× faster than interpreted Python.
-    Falls back to pure Python transparently if numba is not installed.
+    Numba-compiled greedy tracker with linear-prediction continuation.
+
+    Instead of nearest-neighbour distance from prev_f, each slot predicts
+    its next frequency using velocity (per-frame delta from last two frames):
+
+        predicted_f = prev_f[slot] + freq_vel[slot]
+
+    The candidate closest to that prediction wins — no hard tol cutoff.
+    This handles vibrato, portamento, and fast-moving partials that a fixed
+    50/120 Hz window would reject or mis-assign.
     """
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
@@ -203,8 +208,7 @@ def _track_greedy_kernel(
     claimed = np.zeros(n_cand, dtype=np.bool_)
 
     # Build active list sorted by amplitude descending
-    active_idx = np.where(prev_a > 1e-6)[0]
-    # Simple insertion sort — n_partials is small, this is fine in numba
+    active_idx = np.where(prev_a > 1e-9)[0]
     for i in range(1, len(active_idx)):
         key = active_idx[i]
         j   = i - 1
@@ -214,16 +218,17 @@ def _track_greedy_kernel(
         active_idx[j + 1] = key
 
     for ii in range(len(active_idx)):
-        slot = active_idx[ii]
-        best_i  = -1
-        best_d  = tol + 1.0
+        slot      = active_idx[ii]
+        predicted = prev_f[slot] + freq_vel[slot]   # linear prediction
+        best_i    = -1
+        best_d    = 1e18
         for ci in range(n_cand):
             if claimed[ci]: continue
-            d = abs(cand_f[ci] - prev_f[slot])
+            d = abs(cand_f[ci] - predicted)         # distance to prediction, not prev_f
             if d < best_d:
                 best_d = d
                 best_i = ci
-        if best_i >= 0 and best_d <= tol:
+        if best_i >= 0:                             # no tol check — just take nearest
             out_f[slot] = cand_f[best_i]
             out_a[slot] = cand_a[best_i]
             out_p[slot] = cand_p[best_i]
@@ -234,7 +239,7 @@ def _track_greedy_kernel(
     n_births = 0
     birth_idx = np.empty(n_cand, dtype=np.int64)
     for ci in range(n_cand):
-        if not claimed[ci] and cand_a[ci] > 1e-6 and cand_f[ci] > 1e-3:
+        if not claimed[ci] and cand_a[ci] > 1e-10:
             birth_idx[n_births] = ci
             n_births += 1
     birth_idx = birth_idx[:n_births]
@@ -247,10 +252,15 @@ def _track_greedy_kernel(
             j -= 1
         birth_idx[j + 1] = key
 
+    # Voice stealing: sort slots by current amplitude ascending,
+    # then let loud new births overwrite the quietest current partials.
+    # Small hysteresis (0.005) prevents flip-flopping on near-equal partials.
+    slot_order = np.argsort(out_a)   # quietest slot first
     bi = 0
-    for slot in range(n_partials):
+    for si in range(n_partials):
         if bi >= n_births: break
-        if out_a[slot] == 0.0:
+        slot = slot_order[si]
+        if cand_a[birth_idx[bi]] > out_a[slot] + 0.005:
             out_f[slot] = cand_f[birth_idx[bi]]
             out_a[slot] = cand_a[birth_idx[bi]]
             out_p[slot] = cand_p[birth_idx[bi]]
@@ -261,11 +271,10 @@ def _track_greedy_kernel(
 
 def _track_greedy(
     cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
-    prev_f: np.ndarray, prev_a: np.ndarray,
+    prev_f: np.ndarray, prev_a: np.ndarray, freq_vel: np.ndarray,
     n_partials: int,
-    tol: float = 50.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    return _track_greedy_kernel(cand_f, cand_a, cand_p, prev_f, prev_a, n_partials, tol)
+    return _track_greedy_kernel(cand_f, cand_a, cand_p, prev_f, prev_a, freq_vel, n_partials)
 
 
 # ─────────────────────────────────────────────
@@ -348,16 +357,22 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
     all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_p = np.zeros((n_frames, n_partials), dtype=np.float32)
 
-    prev_f = np.zeros(n_partials, dtype=np.float32)
-    prev_a = np.zeros(n_partials, dtype=np.float32)
+    prev_f    = np.zeros(n_partials, dtype=np.float32)
+    prev_a    = np.zeros(n_partials, dtype=np.float32)
+    freq_vel  = np.zeros(n_partials, dtype=np.float32)   # per-partial frequency velocity
 
     if _NUMBA:
         print("   🔥 Numba JIT warm-up (first frame only) …")
     for i in range(n_frames):
         center = i * frame_size + frame_size // 2
-        cf, ca, cp         = _fft_candidates(samples, center, state, n_cand)
-        of, oa, op         = _track_greedy(cf, ca, cp, prev_f, prev_a, n_partials)
+        cf, ca, cp = _fft_candidates(samples, center, state, n_cand)
+        of, oa, op = _track_greedy(cf, ca, cp, prev_f, prev_a, freq_vel, n_partials)
         all_f[i] = of;  all_a[i] = oa;  all_p[i] = op
+
+        # Update velocity: only for slots active in both frames
+        active_both = (oa > 1e-9) & (prev_a > 1e-9)
+        freq_vel = np.where(active_both, of - prev_f, 0.0).astype(np.float32)
+
         prev_f = of;    prev_a = oa
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
