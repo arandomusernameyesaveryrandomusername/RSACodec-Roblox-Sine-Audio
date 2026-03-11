@@ -149,34 +149,18 @@ def _fft_candidates(
 # ─────────────────────────────────────────────
 def _track_greedy(
     cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
-    prev_f: np.ndarray, prev_a: np.ndarray, prev_p: np.ndarray,
+    prev_f: np.ndarray, prev_a: np.ndarray,
     n_partials: int,
-    sample_rate: int,
-    frame_size: int,
     tol: float = 50.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Slot-stable greedy matching with phase-corrected frequency estimation.
+    Slot-stable greedy nearest-frequency matching.
 
-    PHASE CORRECTION (applied to every continuation slot):
-    ───────────────────────────────────────────────────────
-    FFT bins give only integer-resolution frequency estimates.
-    Even with quadratic interpolation there is residual jitter.
-    Phase correction eliminates it by measuring how fast the
-    oscillator is actually spinning between frames:
-
-        expected_advance = 2π · f_bin · dt
-        actual_advance   = curr_phase − prev_phase
-        deviation        = wrap(actual − expected)   # to [-π, π]
-        true_freq        = f_bin + deviation / (2π · dt)
-
-    Using the phase-interpolated freq as f_bin stacks this correction
-    on top of quadratic interpolation for maximum precision.
-    Cost: one subtraction + one modulo per continuation — essentially free.
+    All distance computations are vectorized numpy ops (no Python loops over
+    candidates). The outer slot loop (n_partials iterations) is unavoidable
+    for greedy correctness, but each iteration is a single np.argmin call.
+    At 384 partials this is ~50× faster than the list-pop version.
     """
-    TWO_PI = 2.0 * math.pi
-    dt     = frame_size / sample_rate          # hop duration in seconds
-
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
     out_p = np.zeros(n_partials, dtype=np.float32)
@@ -185,50 +169,34 @@ def _track_greedy(
         return out_f, out_a, out_p
 
     claimed = np.zeros(len(cand_f), dtype=bool)
-    nyquist = sample_rate / 2.0
 
     # Process occupied slots loudest-first
-    active = np.where(prev_a > 1e-6)[0]
-    active = active[np.argsort(prev_a[active])[::-1]]
+    active  = np.where(prev_a > 1e-6)[0]
+    active  = active[np.argsort(prev_a[active])[::-1]]
 
     for slot in active:
         if claimed.all(): break
         dists = np.where(~claimed, np.abs(cand_f - prev_f[slot]), np.inf)
         bi    = int(np.argmin(dists))
         if dists[bi] <= tol:
-            f_bin = float(cand_f[bi])          # quadratic-interpolated freq
-
-            # ── Phase correction ──────────────────────────────────────────
-            # Use f_bin as reference; deviation tells us the true freq offset
-            expected  = TWO_PI * f_bin * dt
-            actual    = float(cand_p[bi]) - float(prev_p[slot])
-            deviation = (actual - expected + math.pi) % TWO_PI - math.pi
-            true_f    = f_bin + deviation / (TWO_PI * dt)
-
-            # Sanity clamp — discard if correction is wildly out of range
-            # (can happen on births misidentified as continuations)
-            if 20.0 <= true_f <= nyquist:
-                out_f[slot] = true_f
-            else:
-                out_f[slot] = f_bin            # fall back to interpolated
-
+            out_f[slot] = cand_f[bi]
             out_a[slot] = cand_a[bi]
             out_p[slot] = cand_p[bi]
             claimed[bi] = True
 
-    # New births → empty slots, loudest first (no phase correction — no prev)
-    births = np.where(~claimed)[0]
+    # New births → empty slots, loudest first
+    births     = np.where(~claimed)[0]
     if len(births):
-        births   = births[np.argsort(cand_a[births])[::-1]]
-        empty    = np.where(out_a == 0)[0]
-        n_assign = min(len(births), len(empty))
-        bi_valid = births[:n_assign]
-        mask     = (cand_a[bi_valid] > 1e-6) & (cand_f[bi_valid] > 1e-3)
-        sl       = empty[:n_assign][mask]
-        bi_v     = bi_valid[mask]
-        out_f[sl] = cand_f[bi_v]
-        out_a[sl] = cand_a[bi_v]
-        out_p[sl] = cand_p[bi_v]
+        births     = births[np.argsort(cand_a[births])[::-1]]
+        empty      = np.where(out_a == 0)[0]
+        n_assign   = min(len(births), len(empty))
+        bi_valid   = births[:n_assign]
+        mask       = (cand_a[bi_valid] > 1e-6) & (cand_f[bi_valid] > 1e-3)
+        sl         = empty[:n_assign][mask]
+        bi_v       = bi_valid[mask]
+        out_f[sl]  = cand_f[bi_v]
+        out_a[sl]  = cand_a[bi_v]
+        out_p[sl]  = cand_p[bi_v]
 
     return out_f, out_a, out_p
 
@@ -322,17 +290,13 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
 
     prev_f = np.zeros(n_partials, dtype=np.float32)
     prev_a = np.zeros(n_partials, dtype=np.float32)
-    prev_p = np.zeros(n_partials, dtype=np.float32)
 
     for i in range(n_frames):
         center = i * frame_size + frame_size // 2
-        cf, ca, cp = _fft_candidates(samples, center, state, n_cand)
-        of, oa, op = _track_greedy(
-            cf, ca, cp, prev_f, prev_a, prev_p,
-            n_partials, sample_rate, frame_size,
-        )
+        cf, ca, cp         = _fft_candidates(samples, center, state, n_cand)
+        of, oa, op         = _track_greedy(cf, ca, cp, prev_f, prev_a, n_partials)
         all_f[i] = of;  all_a[i] = oa;  all_p[i] = op
-        prev_f = of;    prev_a = oa;    prev_p = op
+        prev_f = of;    prev_a = oa
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
             print(f"   … encoded frame {i+1}/{n_frames}", end="\r")
