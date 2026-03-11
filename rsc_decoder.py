@@ -47,27 +47,25 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray]:
     total_samples, = struct.unpack_from("<I",  raw, 15)
     total_frames,  = struct.unpack_from("<I",  raw, 19)
 
-    if magic != b"RSC2":
+    if magic != b"RSC3":
         raise ValueError(f"Unknown magic: {magic!r}")
 
     metadata = dict(magic=magic.decode(), version=version, sample_rate=sample_rate,
                     frame_size=frame_size, n_partials=n_partials,
                     total_samples=total_samples, total_frames=total_frames)
 
-    # ── Bulk decode frame data ────────────────────────────────────────────
-    # Layout per partial: uint16 freq | uint8 amp | int8 phase
-    # Read as structured dtype — one frombuffer call, zero Python loops.
-    # offset=23 (header is 23 bytes now: uint16 n_partials vs old uint8)
-    dtype  = np.dtype([("freq", "<u2"), ("amp", "u1"), ("phase", "i1")])
-    body   = np.frombuffer(raw, dtype=dtype, offset=23)             # (n_frames*n_partials,)
+    # -- RSC3: fixed layout, 6 bytes per partial
+    # uint16 freq | uint16 amp | int16 phase
+    dtype  = np.dtype([("freq", "<u2"), ("amp", "<u2"), ("phase", "<i2")])
+    body   = np.frombuffer(raw, dtype=dtype, offset=23)
     body   = body.reshape(total_frames, n_partials)
 
     nyquist    = sample_rate / 2.0
     freq_scale = nyquist / 65535.0
 
-    freqs  = (body["freq"].astype(np.float32) * freq_scale)         # Hz
-    amps   = (body["amp"].astype(np.float32)  / 255.0)             # linear amplitude
-    phases = (body["phase"].astype(np.float32) / 127.0 * math.pi)  # -π..π
+    freqs  = body["freq"].astype(np.float32)  * freq_scale
+    amps   = body["amp"].astype(np.float32)   / 65535.0
+    phases = body["phase"].astype(np.float32) / 32767.0 * math.pi
 
     return metadata, freqs, amps, phases
 

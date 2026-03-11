@@ -1,5 +1,5 @@
 """
-rsc_encoder.py — Roblox Sine Codec (RSC) Encoder  [optimized]
+rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder  [optimized]
 
 Usage:
     python rsc_encoder.py --input audio.wav --output audio.rsc
@@ -13,11 +13,12 @@ import wave
 
 import numpy as np
 from scipy.signal import find_peaks
+from scipy.signal import windows
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Constants
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 TARGET_FPS         = 60
 DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
@@ -25,9 +26,9 @@ RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 4096     # ~10.8 Hz/bin at 44100
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  WAV Loading
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 def load_wav(path: str) -> tuple[np.ndarray, int]:
     with wave.open(path, "rb") as wf:
         n_channels  = wf.getnchannels()
@@ -57,40 +58,41 @@ def load_wav(path: str) -> tuple[np.ndarray, int]:
     return s, sample_rate
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Analysis State  (precomputed ONCE per run)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 class AnalysisState:
-    """
-    Precomputes all FFT constants so _fft_candidates() is pure computation.
-    Previously np.hanning(4096) and rfftfreq(4096) were called every frame —
-    at 3600 frames/min that's 7200 wasted allocations.
-    """
-    def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
+    def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN, NW: float = 4.0):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = np.hanning(analysis_win).astype(np.float32)
-        self.win_scale = 2.0 / float(np.sum(self.window))
+
+        # DPSS window (Discretely Prolate Spheroidal) for minimal leakage
+        self.window    = windows.dpss(analysis_win, NW, sym=False).astype(np.float32)
+        self.win_scale = 2.0 / float(np.sum(self.window))  # amplitude normalization
+
+        # FFT frequencies
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
+
+        # Minimum bin distance for peak detection (~20 Hz)
         self.min_dist  = max(1, int(20.0 / self.bin_width))
+
+        # Nyquist frequency
         self.nyquist   = sample_rate / 2.0
+
+        # Zero-padding buffer for edge frames
         self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  FFT Candidate Extraction
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 def _fft_candidates(
     audio: np.ndarray,
     center: int,
     state: AnalysisState,
     n_candidates: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Returns (freqs, amps, phases) as float32 numpy arrays — no list boxing.
-    Uses a pre-allocated pad buffer so boundary frames don't heap-allocate.
-    """
     half = state.win // 2
     s, e = center - half, center + half
     n    = len(audio)
@@ -102,7 +104,6 @@ def _fft_candidates(
     else:
         chunk = audio[s:e]
 
-    # float64 for FFT numerical accuracy, then back to float32
     spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
     phs   = np.angle(spec).astype(np.float32)
@@ -111,10 +112,8 @@ def _fft_candidates(
     if len(peak_idx) == 0:
         peak_idx = np.argpartition(mags, -min(n_candidates, len(mags)))[-n_candidates:]
 
-    # Top n_candidates by magnitude
     top = peak_idx[np.argsort(mags[peak_idx])[::-1][:n_candidates]]
 
-    # Vectorized frequency range filter
     f    = state.freqs[top]
     mask = (f >= 20.0) & (f <= state.nyquist - state.bin_width)
     top  = top[mask]
@@ -122,23 +121,15 @@ def _fft_candidates(
     return state.freqs[top], np.clip(mags[top], 0.0, 1.0), phs[top]
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Greedy Peak Tracker
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 def _track_greedy(
     cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
     prev_f: np.ndarray, prev_a: np.ndarray,
     n_partials: int,
     tol: float = 50.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Slot-stable greedy nearest-frequency matching.
-
-    All distance computations are vectorized numpy ops (no Python loops over
-    candidates). The outer slot loop (n_partials iterations) is unavoidable
-    for greedy correctness, but each iteration is a single np.argmin call.
-    At 384 partials this is ~50× faster than the list-pop version.
-    """
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
     out_p = np.zeros(n_partials, dtype=np.float32)
@@ -148,7 +139,6 @@ def _track_greedy(
 
     claimed = np.zeros(len(cand_f), dtype=bool)
 
-    # Process occupied slots loudest-first
     active  = np.where(prev_a > 1e-6)[0]
     active  = active[np.argsort(prev_a[active])[::-1]]
 
@@ -162,7 +152,6 @@ def _track_greedy(
             out_p[slot] = cand_p[bi]
             claimed[bi] = True
 
-    # New births → empty slots, loudest first
     births     = np.where(~claimed)[0]
     if len(births):
         births     = births[np.argsort(cand_a[births])[::-1]]
@@ -179,9 +168,10 @@ def _track_greedy(
     return out_f, out_a, out_p
 
 
-# ─────────────────────────────────────────────
-#  RSC Binary Writer  (fully vectorized)
-# ─────────────────────────────────────────────
+# ---------------------------------------------
+#  RSC3 Binary Writer
+#  Per partial: uint16 freq | uint16 amp | int16 phase  (6 bytes, fixed layout)
+# ---------------------------------------------
 def write_rsc(
     path: str,
     frame_freqs:  np.ndarray,   # (n_frames, n_partials) float32
@@ -189,33 +179,23 @@ def write_rsc(
     frame_phases: np.ndarray,   # (n_frames, n_partials) float32
     sample_rate: int, frame_size: int, total_samples: int,
 ) -> None:
-    """
-    Quantize and pack the entire frame array in one numpy pass.
-
-    Instead of n_frames × n_partials calls to struct.pack_into, we:
-      1. Quantize all three arrays at once with numpy broadcasting
-      2. View uint16 freq as two uint8 bytes (little-endian already on x86)
-      3. np.concatenate into (n_frames, n_partials, 4) uint8 array
-      4. One .tobytes() call writes the entire payload
-    """
     n_frames, n_partials = frame_freqs.shape
     HEADER = 23
 
-    buf = bytearray(HEADER + n_frames * n_partials * 4)
+    buf = bytearray(HEADER + n_frames * n_partials * 6)
     struct.pack_into("<4sBIIHII", buf, 0,
-                     b"RSC2", 2,
+                     b"RSC3", 3,
                      sample_rate, frame_size, n_partials,
                      total_samples, n_frames)
 
     freq_scale = 65535.0 / (sample_rate / 2.0)
-    f16 = np.clip(np.round(frame_freqs  * freq_scale),        0, 65535).astype(np.uint16)
-    a8  = np.clip(np.round(frame_amps   * 255.0),              0,   255).astype(np.uint8)
-    p8  = np.clip(np.round(frame_phases / math.pi * 127.0), -128,   127).astype(np.int8)
+    f16 = np.clip(np.round(frame_freqs  * freq_scale),           0, 65535).astype(np.uint16)
+    a16 = np.clip(np.round(frame_amps   * 65535.0),              0, 65535).astype(np.uint16)
+    p16 = np.clip(np.round(frame_phases / math.pi * 32767.0), -32768, 32767).astype(np.int16)
 
-    # f16 uint16 → two uint8 bytes LE (natural on little-endian; safe everywhere via view)
     f_bytes = f16.view(np.uint8).reshape(n_frames, n_partials, 2)
-    a_bytes = a8.reshape(n_frames, n_partials, 1)
-    p_bytes = p8.view(np.uint8).reshape(n_frames, n_partials, 1)
+    a_bytes = a16.view(np.uint8).reshape(n_frames, n_partials, 2)
+    p_bytes = p16.view(np.uint8).reshape(n_frames, n_partials, 2)
 
     buf[HEADER:] = np.concatenate([f_bytes, a_bytes, p_bytes], axis=2).tobytes()
 
@@ -223,14 +203,14 @@ def write_rsc(
         fh.write(buf)
 
     kb = len(buf) / 1024
-    print(f"  ✅ Wrote {n_frames} frames → {path}  ({kb:.1f} KB, {kb/60:.1f} KB/s)")
+    print(f"  ✅ Wrote {n_frames} frames -> {path}  ({kb:.1f} KB, {kb/60:.1f} KB/s)")
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  Main Encode Pipeline
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -> None:
-    print(f"🎵 RSC Encoder  —  {input_path}")
+    print(f"RSC Encoder  --  {input_path}")
     print(f"   Partials/frame : {n_partials}  |  Target SR: {target_sr} Hz")
 
     samples, native_sr = load_wav(input_path)
@@ -238,7 +218,7 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
           f"({len(samples)/native_sr:.2f}s)")
 
     if native_sr != target_sr:
-        print(f"   Resampling {native_sr} → {target_sr} Hz …")
+        print(f"   Resampling {native_sr} -> {target_sr} Hz ...")
         from math import gcd
         from scipy.signal import resample_poly
         g = gcd(target_sr, native_sr)
@@ -261,7 +241,6 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
     n_cand = n_partials * 4
     print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)")
 
-    # Pre-allocate output matrices — no per-frame list creation
     all_f = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_p = np.zeros((n_frames, n_partials), dtype=np.float32)
@@ -277,17 +256,17 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
         prev_f = of;    prev_a = oa
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
-            print(f"   … encoded frame {i+1}/{n_frames}", end="\r")
+            print(f"   ... encoded frame {i+1}/{n_frames}", end="\r")
 
     print()
     write_rsc(output_path, all_f, all_a, all_p, sample_rate, frame_size, total_samples)
-    kb = (22 + n_frames * n_partials * 4) / 1024
-    print(f"   📦 {kb:.1f} KB  ({kb/1024:.3f} MB)  |  🎉 Done!")
+    kb = (23 + n_frames * n_partials * 6) / 1024
+    print(f"   {kb:.1f} KB  ({kb/1024:.3f} MB)  |  Done!")
 
 
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 #  CLI
-# ─────────────────────────────────────────────
+# ---------------------------------------------
 def main():
     p = argparse.ArgumentParser(description="RSC Encoder",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
