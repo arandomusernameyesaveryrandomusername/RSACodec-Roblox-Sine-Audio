@@ -107,37 +107,46 @@ def synthesize(
     total_len = frame_size * n_frames
     output    = np.zeros(total_len, dtype=np.float64)
 
-    # t is reused every frame
-    t = np.arange(frame_size, dtype=np.float64) / sample_rate  # (frame_size,)
+    t = np.arange(frame_size, dtype=np.float64) / sample_rate
 
-    # Phase state — float64 for accumulation precision
-    phi = np.zeros(n_partials, dtype=np.float64)
-    # Track which slots were active last frame for birth detection
+    phi         = np.zeros(n_partials, dtype=np.float64)
     prev_active = np.zeros(n_partials, dtype=bool)
 
+    # [3] Birth/death amplitude ramp — eliminates clicks on partial on/off
+    # ramp tracks per-slot envelope 0.0 (silent) -> 1.0 (full), 3-frame transition
+    RAMP_STEP = 1.0 / 3.0
+    ramp   = np.zeros(n_partials, dtype=np.float64)
+    last_f = np.zeros(n_partials, dtype=np.float64)  # last known freq (for death fade)
+    last_a = np.zeros(n_partials, dtype=np.float64)  # last known amp  (for death fade)
+
     for i in range(n_frames):
-        f = freqs[i].astype(np.float64)    # (n_partials,)
-        a = amps[i].astype(np.float64)     # (n_partials,)
-        p = phases[i].astype(np.float64)   # (n_partials,) — FFT phase, used only on birth
+        f = freqs[i].astype(np.float64)
+        a = amps[i].astype(np.float64)
+        p = phases[i].astype(np.float64)
 
         active = a > 1e-6
-
-        # Birth detection: slot newly active this frame → seed phase from FFT
         births = active & ~prev_active
         phi[births] = p[births]
 
-        if active.any():
-            fa  = f[active]       # (n_active,)
-            aa  = a[active]       # (n_active,)
-            pa  = phi[active]     # (n_active,)
+        # Update last known values for active slots
+        last_f[active] = f[active]
+        last_a[active] = a[active]
 
-            # All partials × all samples in one broadcast sin call
-            # shape: (n_active, frame_size)
+        # Advance ramp: active slots ramp up, silent slots ramp down
+        ramp[active]  = np.minimum(1.0, ramp[active]  + RAMP_STEP)
+        ramp[~active] = np.maximum(0.0, ramp[~active] - RAMP_STEP)
+
+        # Synthesize any slot still in ramp (includes dying slots fading out)
+        eff = ramp > 1e-9
+        if eff.any():
+            fa = last_f[eff]
+            aa = last_a[eff] * ramp[eff]
+            pa = phi[eff]
             signal_matrix = aa[:, None] * np.sin(TWO_PI * fa[:, None] * t + pa[:, None])
             output[i * frame_size : (i + 1) * frame_size] = signal_matrix.sum(axis=0)
 
-        # Advance phase for ALL slots (including silent — keeps them in sync)
-        phi = (phi + TWO_PI * f * frame_size / sample_rate) % TWO_PI
+        # Advance phase for all ramping slots using their last known freq
+        phi[eff] = (phi[eff] + TWO_PI * last_f[eff] * frame_size / sample_rate) % TWO_PI
 
         prev_active = active
 
