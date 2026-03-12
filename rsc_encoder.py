@@ -20,7 +20,7 @@ from scipy.signal import windows
 #  Constants
 # ---------------------------------------------
 TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 384
+DEFAULT_PARTIALS   = 64
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 4096     # ~10.8 Hz/bin at 44100
@@ -83,6 +83,8 @@ class AnalysisState:
         # Zero-padding buffer for edge frames
         self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
 
+        self.erb = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
+
 
 # ---------------------------------------------
 #  FFT Candidate Extraction
@@ -111,8 +113,8 @@ def _fft_candidates(
     phs   = np.angle(spec).astype(np.float32)
 
     # ─── HFC SCORE — the brutal genius part 🔥 ───
-    # mag² * freq → crushes low-freq junk, lifts air partials naturally
-    hfc_scores = mags ** 2 * state.freqs   # ← core magic, no boost, pure weighting
+    # mag² * erb → better than pure freq weighting, boosts high freqs without overbias
+    hfc_scores = mags**2 * state.erb   # ← core magic, no boost, pure weighting
 
     # ─── Still use find_peaks for true local maxima (avoids bin duplication) ───
     # Restore good spacing — no more distance=1 nonsense
