@@ -1,6 +1,11 @@
 """
 rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder  [optimized]
 
+Format: RSC4
+  Header : 23 bytes  (magic changed RSC3→RSC4, layout identical)
+  Partial: 4 bytes   uint16 freq | uint16 amp
+           (phase removed — decoder simulates phase continuously)
+
 Usage:
     python rsc_encoder.py --input audio.wav --output audio.rsc
     python rsc_encoder.py --input audio.wav --output audio.rsc --partials 384 --samplerate 44100
@@ -76,7 +81,7 @@ class AnalysisState:
         self.bin_width = float(sample_rate) / analysis_win
 
         # Minimum bin distance for peak detection (~25 Hz)
-        self.min_dist = max(2, int(round(25.0 / self.bin_width)))
+        self.min_dist  = max(2, int(round(25.0 / self.bin_width)))
 
         # Nyquist frequency
         self.nyquist   = sample_rate / 2.0
@@ -89,13 +94,14 @@ class AnalysisState:
 
 # ---------------------------------------------
 #  FFT Candidate Extraction
+#  Returns (freqs, amps) only — phase dropped
 # ---------------------------------------------
 def _fft_candidates(
     audio: np.ndarray,
     center: int,
     state: AnalysisState,
     n_candidates: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray]:
     half = state.win // 2
     s, e = center - half, center + half
     n    = len(audio)
@@ -107,10 +113,9 @@ def _fft_candidates(
     else:
         chunk = audio[s:e]
 
-    # ─── FFT + mag/phase ───
+    # ─── FFT + mag ───
     spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
-    phs   = np.angle(spec).astype(np.float32)
 
     # ─── HFC score ───
     hfc_scores = mags**2 * state.erb
@@ -125,9 +130,6 @@ def _fft_candidates(
     # ─── Sort peaks by HFC descending, oversample exactly 2× ───
     peak_hfc   = hfc_scores[peak_idx]
     sort_order = np.argsort(peak_hfc)[::-1]
-
-    # FIX 1: oversample window is exactly n_candidates * 2, so the fallback
-    # index below starts cleanly after everything already considered
     oversampled = peak_idx[sort_order][:n_candidates * 2]
 
     # ─── Freq filter (20 Hz – nyquist) ───
@@ -138,38 +140,35 @@ def _fft_candidates(
     # ─── Fallback: freq filter ate too many peaks ───
     if len(top) < n_candidates:
         extra_needed = n_candidates - len(top)
-        # FIX 2: start after the full oversample window (n_candidates * 2),
-        # not at len(top) — that was overlapping with already-chosen peaks
+        # Start after the full oversample window to avoid duplicates
         remaining = peak_idx[sort_order][n_candidates * 2:]
         extra     = remaining[:extra_needed]
         top       = np.concatenate([top, extra])
 
     ca = np.clip(mags[top], 0.0, 1.0)
-    cp = phs[top]
 
-    return state.freqs[top], ca, cp
+    return state.freqs[top], ca
 
 
 # ---------------------------------------------
 #  Greedy Peak Tracker  (with slot cooldown)
 # ---------------------------------------------
 def _track_greedy(
-    cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
+    cand_f: np.ndarray, cand_a: np.ndarray,
     prev_f: np.ndarray, prev_a: np.ndarray,
     n_partials: int,
     cooldowns: np.ndarray,
     tol: float = 50.0,
     cooldown_frames: int = SLOT_COOLDOWN,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
-    out_p = np.zeros(n_partials, dtype=np.float32)
 
     # Tick down all cooldowns at the top of every frame
     cooldowns = np.maximum(0, cooldowns - 1)
 
     if len(cand_f) == 0:
-        return out_f, out_a, out_p, cooldowns
+        return out_f, out_a, cooldowns
 
     claimed = np.zeros(len(cand_f), dtype=bool)
 
@@ -184,18 +183,16 @@ def _track_greedy(
         if dists[bi] <= tol:
             out_f[slot] = cand_f[bi]
             out_a[slot] = cand_a[bi]
-            out_p[slot] = cand_p[bi]
             claimed[bi] = True
         else:
-            # FIX 4: partial died — lock slot for cooldown_frames before reuse
+            # Partial died — lock slot before reuse
             cooldowns[slot] = cooldown_frames
 
     # Assign unclaimed births to empty cooled-down slots only
     births = np.where(~claimed)[0]
     if len(births):
-        births = births[np.argsort(cand_a[births])[::-1]]
-        # FIX 4: gate on cooldowns == 0 so recently-freed slots are blocked
-        empty  = np.where((out_a == 0) & (cooldowns == 0))[0]
+        births   = births[np.argsort(cand_a[births])[::-1]]
+        empty    = np.where((out_a == 0) & (cooldowns == 0))[0]
         n_assign = min(len(births), len(empty))
         bi_valid = births[:n_assign]
         mask     = (cand_a[bi_valid] > 1e-6) & (cand_f[bi_valid] > 1e-3)
@@ -203,41 +200,39 @@ def _track_greedy(
         bi_v     = bi_valid[mask]
         out_f[sl] = cand_f[bi_v]
         out_a[sl] = cand_a[bi_v]
-        out_p[sl] = cand_p[bi_v]
 
-    return out_f, out_a, out_p, cooldowns
+    return out_f, out_a, cooldowns
 
 
 # ---------------------------------------------
-#  RSC3 Binary Writer
-#  Per partial: uint16 freq | uint16 amp | int16 phase  (6 bytes, fixed layout)
+#  RSC4 Binary Writer
+#  Header : 23 bytes  (identical layout to RSC3, magic = "RSC4")
+#  Partial: 4 bytes   uint16 freq | uint16 amp
+#           (phase removed — saves 2 bytes/partial/frame = 33% smaller files)
 # ---------------------------------------------
 def write_rsc(
     path: str,
-    frame_freqs:  np.ndarray,   # (n_frames, n_partials) float32
-    frame_amps:   np.ndarray,   # (n_frames, n_partials) float32
-    frame_phases: np.ndarray,   # (n_frames, n_partials) float32
+    frame_freqs: np.ndarray,   # (n_frames, n_partials) float32
+    frame_amps:  np.ndarray,   # (n_frames, n_partials) float32
     sample_rate: int, frame_size: int, total_samples: int,
 ) -> None:
     n_frames, n_partials = frame_freqs.shape
     HEADER = 23
 
-    buf = bytearray(HEADER + n_frames * n_partials * 6)
+    buf = bytearray(HEADER + n_frames * n_partials * 4)
     struct.pack_into("<4sBIIHII", buf, 0,
-                     b"RSC3", 3,
+                     b"RSC4", 4,
                      sample_rate, frame_size, n_partials,
                      total_samples, n_frames)
 
     freq_scale = 65535.0 / (sample_rate / 2.0)
-    f16 = np.clip(np.round(frame_freqs  * freq_scale),           0, 65535).astype(np.uint16)
-    a16 = np.clip(np.round(frame_amps   * 65535.0),              0, 65535).astype(np.uint16)
-    p16 = np.clip(np.round(frame_phases / math.pi * 32767.0), -32768, 32767).astype(np.int16)
+    f16 = np.clip(np.round(frame_freqs * freq_scale), 0, 65535).astype(np.uint16)
+    a16 = np.clip(np.round(frame_amps  * 65535.0),    0, 65535).astype(np.uint16)
 
     f_bytes = f16.view(np.uint8).reshape(n_frames, n_partials, 2)
     a_bytes = a16.view(np.uint8).reshape(n_frames, n_partials, 2)
-    p_bytes = p16.view(np.uint8).reshape(n_frames, n_partials, 2)
 
-    buf[HEADER:] = np.concatenate([f_bytes, a_bytes, p_bytes], axis=2).tobytes()
+    buf[HEADER:] = np.concatenate([f_bytes, a_bytes], axis=2).tobytes()
 
     with open(path, "wb") as fh:
         fh.write(buf)
@@ -277,36 +272,34 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
     print(f"   Frame size     : {frame_size} samp  ({1000*frame_size/sample_rate:.2f} ms)"
           f"  |  {n_frames} frames")
 
-    state = AnalysisState(sample_rate)
-
-    # FIX 1: was n_partials * 4 which routinely exceeded available peaks and
-    # silently fell into the broken fallback path on nearly every frame
+    state  = AnalysisState(sample_rate)
     n_cand = min(n_partials * 2, 768)
     print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)"
           f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN} frames")
 
     all_f = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
-    all_p = np.zeros((n_frames, n_partials), dtype=np.float32)
 
     prev_f    = np.zeros(n_partials, dtype=np.float32)
     prev_a    = np.zeros(n_partials, dtype=np.float32)
-    cooldowns = np.zeros(n_partials, dtype=np.int32)  # FIX 4: per-slot death timers
+    cooldowns = np.zeros(n_partials, dtype=np.int32)
 
     for i in range(n_frames):
-        center                    = i * frame_size + frame_size // 2
-        cf, ca, cp                = _fft_candidates(samples, center, state, n_cand)
-        of, oa, op, cooldowns     = _track_greedy(cf, ca, cp, prev_f, prev_a,
-                                                   n_partials, cooldowns)
-        all_f[i] = of;  all_a[i] = oa;  all_p[i] = op
-        prev_f = of;    prev_a = oa
+        center             = i * frame_size + frame_size // 2
+        cf, ca             = _fft_candidates(samples, center, state, n_cand)
+        of, oa, cooldowns  = _track_greedy(cf, ca, prev_f, prev_a,
+                                            n_partials, cooldowns)
+        all_f[i] = of
+        all_a[i] = oa
+        prev_f   = of
+        prev_a   = oa
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
             print(f"   ... encoded frame {i+1}/{n_frames}", end="\r")
 
     print()
-    write_rsc(output_path, all_f, all_a, all_p, sample_rate, frame_size, total_samples)
-    kb = (23 + n_frames * n_partials * 6) / 1024
+    write_rsc(output_path, all_f, all_a, sample_rate, frame_size, total_samples)
+    kb = (23 + n_frames * n_partials * 4) / 1024
     print(f"   {kb:.1f} KB  ({kb/1024:.3f} MB)  |  Done!")
 
 
