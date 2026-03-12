@@ -75,7 +75,7 @@ class AnalysisState:
         self.bin_width = float(sample_rate) / analysis_win
 
         # Minimum bin distance for peak detection (~20 Hz)
-        self.min_dist  = max(1, int(20.0 / self.bin_width))
+        self.min_dist = max(2, int(round(25.0 / self.bin_width)))  # good spacing
 
         # Nyquist frequency
         self.nyquist   = sample_rate / 2.0
@@ -97,6 +97,7 @@ def _fft_candidates(
     s, e = center - half, center + half
     n    = len(audio)
 
+    # ─── Chunk handling (unchanged) ───
     if s < 0 or e > n:
         chunk = state.pad_buf.copy()
         ss, se = max(0, s), min(n, e)
@@ -104,21 +105,45 @@ def _fft_candidates(
     else:
         chunk = audio[s:e]
 
+    # ─── FFT + mag/phase ───
     spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
     phs   = np.angle(spec).astype(np.float32)
 
-    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)
+    # ─── HFC SCORE — the brutal genius part 🔥 ───
+    # mag² * freq → crushes low-freq junk, lifts air partials naturally
+    hfc_scores = mags ** 2 * state.freqs   # ← core magic, no boost, pure weighting
+
+    # ─── Still use find_peaks for true local maxima (avoids bin duplication) ───
+    # Restore good spacing — no more distance=1 nonsense
+    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)  # tiny height to kill numerical garbage
+
     if len(peak_idx) == 0:
-        peak_idx = np.argpartition(mags, -min(n_candidates, len(mags)))[-n_candidates:]
+        # Fallback: top raw by HFC score if no peaks (very flat frames)
+        peak_idx = np.argpartition(hfc_scores, -n_candidates)[-n_candidates:]
 
-    top = peak_idx[np.argsort(mags[peak_idx])[::-1][:n_candidates]]
+    # ─── Sort PEAKS by HFC score descending (this is the smart bit) ───
+    peak_hfc = hfc_scores[peak_idx]
+    sort_order = np.argsort(peak_hfc)[::-1]
+    top = peak_idx[sort_order][:n_candidates * 2]  # oversample a bit for safety
 
+    # ─── Final freq filter (20 Hz – nyquist) ───
     f    = state.freqs[top]
     mask = (f >= 20.0) & (f <= state.nyquist - state.bin_width)
-    top  = top[mask]
+    top  = top[mask][:n_candidates]  # cap exactly at n_candidates
 
-    return state.freqs[top], np.clip(mags[top], 0.0, 1.0), phs[top]
+    # If we somehow lost too many → pad with next best by HFC
+    if len(top) < n_candidates:
+        extra_needed = n_candidates - len(top)
+        remaining = peak_idx[sort_order][len(top):]
+        extra = remaining[:extra_needed]
+        top = np.concatenate([top, extra])
+
+    # ─── Return untouched mags & phases ───
+    ca = np.clip(mags[top], 0.0, 1.0)
+    cp = phs[top]
+
+    return state.freqs[top], ca, cp
 
 
 # ---------------------------------------------
