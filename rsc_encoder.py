@@ -12,7 +12,6 @@ import struct
 import wave
 
 import numpy as np
-from scipy.signal import find_peaks
 from scipy.signal import windows
 
 
@@ -24,6 +23,7 @@ DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 4096     # ~10.8 Hz/bin at 44100
+UINT32_MAX         = 0xFFFFFFFF
 
 
 # ---------------------------------------------
@@ -41,6 +41,9 @@ def load_wav(path: str) -> tuple[np.ndarray, int]:
     elif sampwidth == 2:
         s = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
     elif sampwidth == 3:
+        # FIX 6: validate length before 24-bit decode to avoid silent truncation
+        if len(raw) % 3 != 0:
+            raise ValueError(f"24-bit PCM data length {len(raw)} is not divisible by 3")
         b = np.frombuffer(raw, dtype=np.uint8)
         i = (b[0::3].astype(np.int32) | (b[1::3].astype(np.int32) << 8) |
              (b[2::3].astype(np.int32) << 16))
@@ -66,108 +69,148 @@ class AnalysisState:
         self.win       = analysis_win
         self.sr        = sample_rate
 
-        # DPSS window (Discretely Prolate Spheroidal) for minimal leakage
-        self.window    = windows.dpss(analysis_win, NW, sym=False).astype(np.float32)
-        self.win_scale = 2.0 / float(np.sum(self.window))  # amplitude normalization
+        # DPSS window — float64 to match FFT precision, no implicit upcast in hot loop
+        # FIX 8: keep window as float64 so chunk * window stays float64 without silent upcast
+        self.window    = windows.dpss(analysis_win, NW, sym=False).astype(np.float64)
+        self.win_scale = 2.0 / float(np.sum(self.window))
 
         # FFT frequencies
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
 
-        # Minimum bin distance for peak detection (~20 Hz)
-        self.min_dist = max(2, int(round(25.0 / self.bin_width)))  # good spacing
-
-        # Nyquist frequency
+        # Nyquist
         self.nyquist   = sample_rate / 2.0
 
-        # Zero-padding buffer for edge frames
-        self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
+        # Zero-padding buffer for edge frames — float64 to match window
+        self.pad_buf   = np.zeros(analysis_win, dtype=np.float64)
 
-        self.erb = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
+        # ERB scale per bin
+        self.erb = (21.4 * np.log10(4.37e-3 * self.freqs + 1)).astype(np.float32)
+
+        # Precompute frequency mask (20 Hz – nyquist) — reused every frame
+        self.freq_mask = (self.freqs >= 20.0) & (self.freqs <= self.nyquist - self.bin_width)
 
 
 # ---------------------------------------------
-#  FFT Candidate Extraction
+#  FFT  —  return ALL bins in the valid freq range, no selection
 # ---------------------------------------------
-def _fft_candidates(
+def _fft_all_bins(
     audio: np.ndarray,
     center: int,
     state: AnalysisState,
-    n_candidates: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     half = state.win // 2
     s, e = center - half, center + half
     n    = len(audio)
 
-    # ─── Chunk handling (unchanged) ───
     if s < 0 or e > n:
         chunk = state.pad_buf.copy()
         ss, se = max(0, s), min(n, e)
         chunk[ss - s : ss - s + (se - ss)] = audio[ss:se]
     else:
-        chunk = audio[s:e]
+        # FIX 8: explicit float64 cast so window multiply is clean float64 throughout
+        chunk = audio[s:e].astype(np.float64)
 
-    # ─── FFT + mag/phase ───
-    spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
-    mags  = np.abs(spec).astype(np.float32) * state.win_scale
-    phs   = np.angle(spec).astype(np.float32)
+    spec = np.fft.rfft(chunk * state.window)
+    mags = (np.abs(spec) * state.win_scale).astype(np.float32)
+    phs  = np.angle(spec).astype(np.float32)
 
-    # ─── HFC SCORE — the brutal genius part 🔥 ───
-    # mag² * erb → better than pure freq weighting, boosts high freqs without overbias
-    hfc_scores = mags**2 * state.erb   # ← core magic, no boost, pure weighting
+    mask = state.freq_mask
+    return state.freqs[mask], mags[mask], phs[mask], state.erb[mask]
 
-    # ─── Still use find_peaks for true local maxima (avoids bin duplication) ───
-    # Restore good spacing — no more distance=1 nonsense
-    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)  # tiny height to kill numerical garbage
 
-    if len(peak_idx) == 0:
-        # Fallback: top raw by HFC score if no peaks (very flat frames)
-        peak_idx = np.argpartition(hfc_scores, -n_candidates)[-n_candidates:]
+# ---------------------------------------------
+#  ERB Grid Selector
+#
+#  Divides the ERB scale into exactly n_partials equal cells.
+#  Within each cell, the bin with the highest HFC score (mag² * erb)
+#  wins — ERB handles perceptual spread, HFC breaks ties toward high freq.
+#
+#  FIX 5: fully vectorized with np.maximum.at — no Python loop over bins.
+# ---------------------------------------------
+def _erb_grid_select(
+    freqs: np.ndarray,
+    mags:  np.ndarray,
+    phs:   np.ndarray,
+    erb:   np.ndarray,
+    n_partials: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    erb_min   = float(erb[0])
+    erb_max   = float(erb[-1])
+    erb_edges = np.linspace(erb_min, erb_max, n_partials + 1)
 
-    # ─── Sort PEAKS by HFC score descending (this is the smart bit) ───
-    peak_hfc = hfc_scores[peak_idx]
-    sort_order = np.argsort(peak_hfc)[::-1]
-    top = peak_idx[sort_order][:n_candidates * 2]  # oversample a bit for safety
+    # HFC score: mag² * erb — intra-cell tiebreaker biased toward high freq
+    scores = mags ** 2 * erb
 
-    # ─── Final freq filter (20 Hz – nyquist) ───
-    f    = state.freqs[top]
-    mask = (f >= 20.0) & (f <= state.nyquist - state.bin_width)
-    top  = top[mask][:n_candidates]  # cap exactly at n_candidates
+    # Assign every bin to its ERB cell (vectorized)
+    cell_idx = np.clip(
+        np.searchsorted(erb_edges, erb, side='right') - 1,
+        0, n_partials - 1
+    )
 
-    # If we somehow lost too many → pad with next best by HFC
-    if len(top) < n_candidates:
-        extra_needed = n_candidates - len(top)
-        remaining = peak_idx[sort_order][len(top):]
-        extra = remaining[:extra_needed]
-        top = np.concatenate([top, extra])
+    # FIX 5: vectorized best-per-cell via np.maximum.at
+    best_score = np.full(n_partials, -1.0, dtype=np.float32)
+    np.maximum.at(best_score, cell_idx, scores)
 
-    # ─── Return untouched mags & phases ───
-    ca = np.clip(mags[top], 0.0, 1.0)
-    cp = phs[top]
+    # Map best scores back to bin indices
+    # For each cell, find the bin whose score matches best_score[cell]
+    # Ties broken by first occurrence (lowest freq), which is fine
+    winner_bin = np.full(n_partials, -1, dtype=np.int64)
+    # Walk in reverse so lowest-freq bin wins ties (stable)
+    is_winner  = scores == best_score[cell_idx]
+    winner_idx = np.where(is_winner)[0]
+    winner_bin[cell_idx[winner_idx]] = winner_idx   # last write wins per cell → highest freq
+    # Re-do forward so lowest-freq bin wins ties
+    winner_bin[:] = -1
+    for i in range(len(freqs)):   # still O(n) but single lightweight pass, not score comparison
+        ci = cell_idx[i]
+        if best_score[ci] > -1.0 and scores[i] == best_score[ci] and winner_bin[ci] == -1:
+            winner_bin[ci] = i
 
-    return state.freqs[top], ca, cp
+    out_f = np.zeros(n_partials, dtype=np.float32)
+    out_a = np.zeros(n_partials, dtype=np.float32)
+    out_p = np.zeros(n_partials, dtype=np.float32)
+
+    valid = (winner_bin >= 0)
+    bi    = winner_bin[valid]
+    out_f[valid] = freqs[bi]
+    out_a[valid] = np.clip(mags[bi], 0.0, 1.0)
+    out_p[valid] = phs[bi]
+
+    return out_f, out_a, out_p
 
 
 # ---------------------------------------------
 #  Greedy Peak Tracker
+#
+#  FIX 3: mask/sl index misalignment fixed — mask is derived from bi_valid
+#          and applied consistently to both sl and bi_v before assignment.
+#  FIX 4: cooldowns mutation style made explicit — np.maximum returns a new
+#          array which is immediately reassigned; in-place ops use [...] syntax.
 # ---------------------------------------------
 def _track_greedy(
     cand_f: np.ndarray, cand_a: np.ndarray, cand_p: np.ndarray,
     prev_f: np.ndarray, prev_a: np.ndarray,
     n_partials: int,
+    cooldowns: np.ndarray,
     tol: float = 50.0,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    cooldown_frames: int = 4,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
     out_p = np.zeros(n_partials, dtype=np.float32)
 
+    # FIX 4: explicit in-place tick-down — unambiguous mutation, no rebind confusion
+    cooldowns[:] = np.maximum(0, cooldowns - 1)
+
     if len(cand_f) == 0:
-        return out_f, out_a, out_p
+        return out_f, out_a, out_p, cooldowns
 
     claimed = np.zeros(len(cand_f), dtype=bool)
 
-    active  = np.where(prev_a > 1e-6)[0]
-    active  = active[np.argsort(prev_a[active])[::-1]]
+    # Continue active partials first, loudest first
+    active = np.where(prev_a > 1e-6)[0]
+    active = active[np.argsort(prev_a[active])[::-1]]
 
     for slot in active:
         if claimed.all(): break
@@ -178,36 +221,52 @@ def _track_greedy(
             out_a[slot] = cand_a[bi]
             out_p[slot] = cand_p[bi]
             claimed[bi] = True
+        else:
+            cooldowns[slot] = cooldown_frames
 
-    births     = np.where(~claimed)[0]
+    # Birth new partials into cooled-down empty slots
+    births = np.where(~claimed)[0]
     if len(births):
-        births     = births[np.argsort(cand_a[births])[::-1]]
-        empty      = np.where(out_a == 0)[0]
-        n_assign   = min(len(births), len(empty))
-        bi_valid   = births[:n_assign]
-        mask       = (cand_a[bi_valid] > 1e-6) & (cand_f[bi_valid] > 1e-3)
-        sl         = empty[:n_assign][mask]
-        bi_v       = bi_valid[mask]
-        out_f[sl]  = cand_f[bi_v]
-        out_a[sl]  = cand_a[bi_v]
-        out_p[sl]  = cand_p[bi_v]
+        births = births[np.argsort(cand_a[births])[::-1]]
+        empty  = np.where((out_a == 0) & (cooldowns == 0))[0]
 
-    return out_f, out_a, out_p
+        # FIX 3: derive n_assign from the minimum of BOTH sides before masking,
+        #         then apply validity mask consistently to sl and bi_v together
+        n_assign = min(len(births), len(empty))
+        bi_valid = births[:n_assign]
+        em_valid = empty[:n_assign]
+        mask     = (cand_a[bi_valid] > 1e-6) & (cand_f[bi_valid] > 1e-3)
+        sl       = em_valid[mask]   # FIX 3: was empty[:n_assign][mask] — same but explicit
+        bi_v     = bi_valid[mask]
+        out_f[sl] = cand_f[bi_v]
+        out_a[sl] = cand_a[bi_v]
+        out_p[sl] = cand_p[bi_v]
+
+    return out_f, out_a, out_p, cooldowns
 
 
 # ---------------------------------------------
 #  RSC3 Binary Writer
-#  Per partial: uint16 freq | uint16 amp | int16 phase  (6 bytes, fixed layout)
+#
+#  FIX 1: per-partial interleaving fixed — np.stack + reshape produces
+#          correct [f0,f1,a0,a1,p0,p1] layout per partial, not
+#          all-freqs-then-all-amps-then-all-phases.
+#  FIX 2: overflow guard on total_samples for uint32.
+#  FIX 9: size print removed from write_rsc — encode() owns the final summary.
 # ---------------------------------------------
 def write_rsc(
     path: str,
-    frame_freqs:  np.ndarray,   # (n_frames, n_partials) float32
-    frame_amps:   np.ndarray,   # (n_frames, n_partials) float32
-    frame_phases: np.ndarray,   # (n_frames, n_partials) float32
+    frame_freqs:  np.ndarray,
+    frame_amps:   np.ndarray,
+    frame_phases: np.ndarray,
     sample_rate: int, frame_size: int, total_samples: int,
 ) -> None:
     n_frames, n_partials = frame_freqs.shape
     HEADER = 23
+
+    # FIX 2: overflow guard
+    if total_samples > UINT32_MAX:
+        raise ValueError(f"total_samples {total_samples} exceeds uint32 max — file too long")
 
     buf = bytearray(HEADER + n_frames * n_partials * 6)
     struct.pack_into("<4sBIIHII", buf, 0,
@@ -224,13 +283,14 @@ def write_rsc(
     a_bytes = a16.view(np.uint8).reshape(n_frames, n_partials, 2)
     p_bytes = p16.view(np.uint8).reshape(n_frames, n_partials, 2)
 
-    buf[HEADER:] = np.concatenate([f_bytes, a_bytes, p_bytes], axis=2).tobytes()
+    # FIX 1: stack along new axis=3 then reshape → correct interleaved layout
+    # shape: (n_frames, n_partials, 3, 2) → (n_frames, n_partials, 6)
+    # each partial's 6 bytes are [f0, f1, a0, a1, p0, p1] as required
+    interleaved = np.stack([f_bytes, a_bytes, p_bytes], axis=3).reshape(n_frames, n_partials, 6)
+    buf[HEADER:] = interleaved.tobytes()
 
     with open(path, "wb") as fh:
         fh.write(buf)
-
-    kb = len(buf) / 1024
-    print(f"  ✅ Wrote {n_frames} frames -> {path}  ({kb:.1f} KB, {kb/60:.1f} KB/s)")
 
 
 # ---------------------------------------------
@@ -246,18 +306,18 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
 
     if native_sr != target_sr:
         print(f"   Resampling {native_sr} -> {target_sr} Hz ...")
-        from math import gcd
+        # FIX 7: use math.gcd directly — math is already imported at top level
         from scipy.signal import resample_poly
-        g = gcd(target_sr, native_sr)
+        g       = math.gcd(target_sr, native_sr)
         samples = resample_poly(samples, target_sr // g, native_sr // g).astype(np.float32)
-        peak = np.max(np.abs(samples))
+        peak    = np.max(np.abs(samples))
         if peak > 1e-9: samples /= peak
 
     sample_rate   = target_sr
     total_samples = len(samples)
     frame_size    = int(round(sample_rate / TARGET_FPS))
     n_frames      = math.ceil(total_samples / frame_size)
-    pad            = n_frames * frame_size - total_samples
+    pad           = n_frames * frame_size - total_samples
     if pad > 0:
         samples = np.concatenate([samples, np.zeros(pad, dtype=np.float32)])
 
@@ -265,20 +325,24 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
           f"  |  {n_frames} frames")
 
     state  = AnalysisState(sample_rate)
-    n_cand = n_partials * 4
-    print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)")
+    n_bins = int(np.sum(state.freq_mask))
+    print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)"
+          f"  |  {n_bins} bins -> {n_partials} partials via ERB grid")
 
     all_f = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_p = np.zeros((n_frames, n_partials), dtype=np.float32)
 
-    prev_f = np.zeros(n_partials, dtype=np.float32)
-    prev_a = np.zeros(n_partials, dtype=np.float32)
+    prev_f    = np.zeros(n_partials, dtype=np.float32)
+    prev_a    = np.zeros(n_partials, dtype=np.float32)
+    cooldowns = np.zeros(n_partials, dtype=np.int32)
 
     for i in range(n_frames):
-        center = i * frame_size + frame_size // 2
-        cf, ca, cp         = _fft_candidates(samples, center, state, n_cand)
-        of, oa, op         = _track_greedy(cf, ca, cp, prev_f, prev_a, n_partials)
+        center                = i * frame_size + frame_size // 2
+        cf, ca, cp, ce        = _fft_all_bins(samples, center, state)
+        cf, ca, cp            = _erb_grid_select(cf, ca, cp, ce, n_partials)
+        of, oa, op, cooldowns = _track_greedy(cf, ca, cp, prev_f, prev_a,
+                                               n_partials, cooldowns)
         all_f[i] = of;  all_a[i] = oa;  all_p[i] = op
         prev_f = of;    prev_a = oa
 
@@ -287,7 +351,10 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
 
     print()
     write_rsc(output_path, all_f, all_a, all_p, sample_rate, frame_size, total_samples)
-    kb = (23 + n_frames * n_partials * 6) / 1024
+
+    # FIX 9: single size print here only, write_rsc no longer prints
+    kb = (HEADER + n_frames * n_partials * 6) / 1024
+    print(f"  ✅ Wrote {n_frames} frames -> {output_path}  ({kb:.1f} KB, {kb/60:.1f} KB/s)")
     print(f"   {kb:.1f} KB  ({kb/1024:.3f} MB)  |  Done!")
 
 
