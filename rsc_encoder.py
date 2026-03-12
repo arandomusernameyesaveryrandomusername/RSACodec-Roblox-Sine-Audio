@@ -20,7 +20,7 @@ from scipy.signal import windows
 #  Constants
 # ---------------------------------------------
 TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 64
+DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 4096     # ~10.8 Hz/bin at 44100
