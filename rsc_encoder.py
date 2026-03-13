@@ -6,7 +6,7 @@ Format: RSC4
   Partial: 4 bytes   uint16 freq | uint16 amp
            (phase removed — decoder simulates phase continuously)
 
-Usage:   
+Usage:
     python rsc_encoder.py --input audio.wav --output audio.rsc
     python rsc_encoder.py --input audio.wav --output audio.rsc --partials 384 --samplerate 44100
 """
@@ -29,7 +29,7 @@ DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 4096     # ~10.8 Hz/bin at 44100
-SLOT_COOLDOWN      = 0        # frames a slot must wait after death before reuse
+SLOT_COOLDOWN      = 4        # frames a slot must wait after death before reuse
 
 
 # ---------------------------------------------
@@ -69,7 +69,6 @@ def load_wav(path: str) -> tuple[np.ndarray, int]:
 # ---------------------------------------------
 class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN, NW: float = 4.0):
-
         self.win       = analysis_win
         self.sr        = sample_rate
 
@@ -325,7 +324,7 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
           f"  |  {n_frames} frames")
 
     state  = AnalysisState(sample_rate)
-    n_cand = ANALYSIS_WIN // 2 
+    n_cand = n_partials
     print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)"
           f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN} frames")
 
