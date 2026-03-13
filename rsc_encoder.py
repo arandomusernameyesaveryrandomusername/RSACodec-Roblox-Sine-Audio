@@ -1,10 +1,16 @@
 """
-rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder  [optimized]
+rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder
 
-Format: RSC4
-  Header : 23 bytes  (magic RSC4, layout identical to RSC3)
-  Partial: 4 bytes   uint16 freq | uint16 amp
-           (phase removed — decoder simulates phase continuously)
+Format: RSC6
+  Header  : 35 bytes
+  Sections (in order):
+    1. Bitmasks   : nF * 2 * mask_sz bytes  (alive_mask + born_mask per frame, uncompressed)
+    2. Born data  : born_data_sz bytes       (uint16 freq_q + uint8 amp_mu per born partial)
+    3. Freq deltas: rice_freq_sz bytes       (zigzag + Rice(k_freq) coded int16 freq deltas)
+    4. Amp deltas : remaining bytes          (zigzag + Rice(k_amp)  coded int8  amp deltas)
+
+  Phase not stored — decoder accumulates continuously.
+  Alive/continuing partial data costs ~2-4 bits/value after Rice coding.
 
 Usage:
     python rsc_encoder.py --input audio.wav --output audio.rsc
@@ -17,24 +23,97 @@ import struct
 import wave
 
 import numpy as np
-from scipy.signal import find_peaks
-from scipy.signal import windows
+from scipy.signal import find_peaks, windows
 
 
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 #  Constants
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 TARGET_FPS         = 60
 DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
-ANALYSIS_WIN       = 4096     # ~10.8 Hz/bin at 44100
-SLOT_COOLDOWN      = 4        # frames a slot must wait after death before reuse
+ANALYSIS_WIN       = 4096
+SLOT_COOLDOWN      = 4
+MU                 = 255.0
+ALIVE_THRESHOLD    = 1e-4
+_LOG1P_MU          = math.log1p(MU)
 
 
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
+#  Mu-law
+# ─────────────────────────────────────────────────────────────
+def _mulaw_encode(x: np.ndarray) -> np.ndarray:
+    """float32 [0,1] → uint8 [0,255]"""
+    x = np.clip(x.astype(np.float64), 0.0, 1.0)
+    return np.clip(np.round(MU * np.log1p(MU * x) / _LOG1P_MU), 0, 255).astype(np.uint8)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Rice helpers
+# ─────────────────────────────────────────────────────────────
+def _zigzag(arr: np.ndarray) -> np.ndarray:
+    """signed int32 → non-negative uint32  (0→0, -1→1, 1→2, -2→3, …)"""
+    a = arr.astype(np.int32)
+    return ((a << 1) ^ (a >> 31)).astype(np.uint32)
+
+
+def _optimal_k(vals: np.ndarray) -> int:
+    """Brute-force optimal Rice parameter k in [0, 15]."""
+    n = len(vals)
+    if n == 0:
+        return 0
+    v64 = vals.astype(np.int64)
+    best_k, best_bits = 0, float("inf")
+    for k in range(16):
+        bits = int(np.sum(v64 >> k)) + n * (1 + k)
+        if bits < best_bits:
+            best_bits, best_k = bits, k
+    return best_k
+
+
+def _rice_encode(vals: np.ndarray, k: int) -> bytearray:
+    """
+    Vectorised Rice encoder — MSB-first bit packing.
+    vals  : 1-D uint32 array (non-negative, already zigzag encoded)
+    k     : Rice parameter
+    returns: packed bytes
+    """
+    n = len(vals)
+    if n == 0:
+        return bytearray()
+
+    v64        = vals.astype(np.int64)
+    quotients  = v64 >> k
+    remainders = v64 & ((1 << k) - 1)
+    # Each symbol: quotient zeros | one 1 | k remainder bits (MSB first)
+    code_lens  = quotients + 1 + k
+    total_bits = int(code_lens.sum())
+
+    bits   = np.zeros(total_bits, dtype=np.uint8)
+    starts = np.empty(n, dtype=np.int64)
+    starts[0] = 0
+    if n > 1:
+        starts[1:] = np.cumsum(code_lens[:-1])
+
+    # Place the terminating 1 for each symbol (after quotient zeros)
+    bits[(starts + quotients).astype(int)] = 1
+
+    # Remainder bits (MSB first, k bits per value)
+    for bit_idx in range(k):
+        shift     = k - 1 - bit_idx
+        positions = (starts + quotients + 1 + bit_idx).astype(int)
+        bits[positions] = ((remainders >> shift) & 1).astype(np.uint8)
+
+    pad = (-total_bits) % 8
+    if pad:
+        bits = np.append(bits, np.zeros(pad, dtype=np.uint8))
+    return bytearray(np.packbits(bits, bitorder="big"))
+
+
+# ─────────────────────────────────────────────────────────────
 #  WAV Loading
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 def load_wav(path: str) -> tuple[np.ndarray, int]:
     with wave.open(path, "rb") as wf:
         n_channels  = wf.getnchannels()
@@ -60,42 +139,31 @@ def load_wav(path: str) -> tuple[np.ndarray, int]:
     if n_channels > 1:
         s = s.reshape(-1, n_channels).mean(axis=1)
     peak = np.max(np.abs(s))
-    if peak > 1e-9: s /= peak
+    if peak > 1e-9:
+        s /= peak
     return s, sample_rate
 
 
-# ---------------------------------------------
-#  Analysis State  (precomputed ONCE per run)
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
+#  Analysis State
+# ─────────────────────────────────────────────────────────────
 class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN, NW: float = 4.0):
         self.win       = analysis_win
         self.sr        = sample_rate
-
-        # DPSS window (Discretely Prolate Spheroidal) for minimal leakage
         self.window    = windows.dpss(analysis_win, NW, sym=False).astype(np.float32)
-        self.win_scale = 2.0 / float(np.sum(self.window))  # amplitude normalization
-
-        # FFT frequencies
+        self.win_scale = 2.0 / float(np.sum(self.window))
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
-
-        # Minimum bin distance for peak detection (~25 Hz)
         self.min_dist  = max(2, int(round(25.0 / self.bin_width)))
-
-        # Nyquist frequency
         self.nyquist   = sample_rate / 2.0
-
-        # Zero-padding buffer for edge frames
         self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
+        self.erb       = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
 
-        self.erb = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
 
-
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 #  FFT Candidate Extraction
-#  Returns (freqs, amps) only — phase dropped
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 def _fft_candidates(
     audio: np.ndarray,
     center: int,
@@ -113,75 +181,61 @@ def _fft_candidates(
     else:
         chunk = audio[s:e]
 
-    # ─── FFT + mag ───
     spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
+    hfc   = mags**2 * state.erb
 
-    # ─── HFC score ───
-    hfc_scores = mags**2 * state.erb
-
-    # ─── True local maxima ───
     peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)
-
     if len(peak_idx) == 0:
-        # Fallback: very flat frame — take top n_candidates by HFC directly
-        peak_idx = np.argpartition(hfc_scores, -n_candidates)[-n_candidates:]
+        peak_idx = np.argpartition(hfc, -n_candidates)[-n_candidates:]
 
-    # ─── Sort peaks by HFC descending ───
-    peak_hfc      = hfc_scores[peak_idx]
+    peak_hfc      = hfc[peak_idx]
     sort_order    = np.argsort(peak_hfc)[::-1]
     sorted_idx    = peak_idx[sort_order]
     n_peaks_total = len(sorted_idx)
 
-    # ─── Dynamic oversampling — scales with spectral density ───
     if n_peaks_total <= n_candidates:
         oversample_factor = 1.0
     else:
         loudest           = peak_hfc[sort_order[0]] + 1e-12
-        relative_strength = peak_hfc[sort_order] / loudest
-        cum_energy        = np.cumsum(relative_strength)
-        knee_idx          = np.searchsorted(cum_energy, 0.80 * cum_energy[-1])
-        significant_count = max(n_candidates, knee_idx + 1)
+        rel               = peak_hfc[sort_order] / loudest
+        cum               = np.cumsum(rel)
+        knee              = np.searchsorted(cum, 0.80 * cum[-1])
+        sig               = max(n_candidates, knee + 1)
         n_top             = min(n_candidates * 2, n_peaks_total // 2 + 1)
-        top_energy_ratio  = np.sum(peak_hfc[sort_order[:n_top]]) / (np.sum(peak_hfc) + 1e-12)
-        spread_factor     = 1.0 / (top_energy_ratio + 0.05)
-        crowd_pressure    = (significant_count / n_candidates) * spread_factor
-        oversample_factor = 1.0 + crowd_pressure
+        top_ratio         = np.sum(peak_hfc[sort_order[:n_top]]) / (np.sum(peak_hfc) + 1e-12)
+        spread            = 1.0 / (top_ratio + 0.05)
+        oversample_factor = 1.0 + (sig / n_candidates) * spread
 
     n_take      = min(n_peaks_total, int(n_candidates * oversample_factor + 0.5))
     n_take      = max(n_take, min(n_candidates, n_peaks_total))
     oversampled = sorted_idx[:n_take]
 
-    # ─── Freq filter (20 Hz – nyquist) ───
     f    = state.freqs[oversampled]
     mask = (f >= 20.0) & (f <= state.nyquist - state.bin_width)
     top  = oversampled[mask]
 
-    # ─── Fallback if filter ate too many (now very rare) ───
     if len(top) < n_candidates:
         extra_needed = n_candidates - len(top)
         remaining    = sorted_idx[n_take:]
-        extra        = remaining[:min(extra_needed, len(remaining))]
-        top          = np.concatenate([top, extra])
+        top          = np.concatenate([top, remaining[:min(extra_needed, len(remaining))]])
 
     return state.freqs[top], np.clip(mags[top], 0.0, 1.0)
 
 
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 #  Greedy Peak Tracker
-#  2nd-order prediction + perceptual adaptive tolerance + slot cooldown
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 def _track_greedy(
     cand_f: np.ndarray, cand_a: np.ndarray,
     prev_f: np.ndarray, prev_a: np.ndarray,
-    prevprev_f: np.ndarray,                  # two frames back — needed for acceleration
+    prevprev_f: np.ndarray,
     n_partials: int,
     cooldowns: np.ndarray,
     cooldown_frames: int = SLOT_COOLDOWN,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
-
     cooldowns = np.maximum(0, cooldowns - 1)
 
     if len(cand_f) == 0:
@@ -194,52 +248,29 @@ def _track_greedy(
     for slot in active:
         if claimed.all(): break
 
-        # ── 1. 2nd-order prediction (acceleration-aware) ──────────────────
         if prevprev_f[slot] > 1e-3:
             predicted_f = 2.0 * prev_f[slot] - prevprev_f[slot]
-            delta = abs(predicted_f - prev_f[slot])
-            if delta > 400 or not (20 < predicted_f < 22050):
-                predicted_f = prev_f[slot]   # degenerate — fall back to 1st order
+            if abs(predicted_f - prev_f[slot]) > 400 or not (20 < predicted_f < 22050):
+                predicted_f = prev_f[slot]
         else:
             predicted_f = prev_f[slot]
 
-        search_center = predicted_f
+        sc            = predicted_f
+        tol           = max(sc * 0.038, (24.7 + 0.108 * sc) * 0.55)
+        dists         = np.where(~claimed, np.abs(cand_f - sc), np.inf)
+        bi            = int(np.argmin(dists))
+        tol          *= 1.25 if cand_f[bi] > sc else 0.85
+        tol          *= float(np.interp(prev_a[slot], [0.03, 0.15, 0.6, 1.0], [0.5, 0.8, 1.2, 1.6]))
+        tol          *= min(2.0, 1.0 + (abs(prev_f[slot] - prevprev_f[slot])
+                             if prevprev_f[slot] > 1e-3 else 0.0) / 80.0)
 
-        # ── 2. Base tolerance: relative cents + ERB floor ─────────────────
-        cents_base = search_center * 0.038          # ~46 cents
-        erb_floor  = 24.7 + 0.108 * search_center   # true ERB formula
-        tol        = max(cents_base, erb_floor * 0.55)
-
-        # ── 3. Find nearest unclaimed candidate to search_center ──────────
-        dists = np.where(~claimed, np.abs(cand_f - search_center), np.inf)
-        bi    = int(np.argmin(dists))
-
-        # ── 4. Asymmetric allowance ───────────────────────────────────────
-        if cand_f[bi] > search_center:
-            tol *= 1.25   # +25% upward stretch
-        else:
-            tol *= 0.85   # tighter downward
-
-        # ── 5. Amplitude confidence multiplier ───────────────────────────
-        amp_conf = float(np.interp(prev_a[slot],
-                                   [0.03, 0.15, 0.6, 1.0],
-                                   [0.5,  0.8,  1.2, 1.6]))
-        tol *= amp_conf
-
-        # ── 6. Velocity / instability boost ──────────────────────────────
-        recent_delta   = abs(prev_f[slot] - prevprev_f[slot]) if prevprev_f[slot] > 1e-3 else 0.0
-        velocity_boost = min(2.0, 1.0 + recent_delta / 80.0)
-        tol *= velocity_boost
-
-        # ── 7. Soft gate at 1.8× tol ─────────────────────────────────────
         if dists[bi] <= tol * 1.8:
             out_f[slot] = cand_f[bi]
             out_a[slot] = cand_a[bi]
             claimed[bi] = True
         else:
-            cooldowns[slot] = cooldown_frames   # partial died
+            cooldowns[slot] = cooldown_frames
 
-    # ── Birth assignment: unclaimed → empty cooled-down slots ────────────
     births = np.where(~claimed)[0]
     if len(births):
         births   = births[np.argsort(cand_a[births])[::-1]]
@@ -247,54 +278,142 @@ def _track_greedy(
         n_assign = min(len(births), len(empty))
         bi_valid = births[:n_assign]
         mask     = (cand_a[bi_valid] > 1e-6) & (cand_f[bi_valid] > 1e-3)
-        sl       = empty[:n_assign][mask]
-        bi_v     = bi_valid[mask]
+        sl, bi_v = empty[:n_assign][mask], bi_valid[mask]
         out_f[sl] = cand_f[bi_v]
         out_a[sl] = cand_a[bi_v]
 
     return out_f, out_a, cooldowns
 
 
-# ---------------------------------------------
-#  RSC4 Binary Writer
-#  Header : 23 bytes  (magic = "RSC4", layout identical to RSC3)
-#  Partial: 4 bytes   uint16 freq | uint16 amp
-#           (phase removed — 33% smaller than RSC3)
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
+#  RSC6 Binary Writer
+#
+#  Header (35 bytes):
+#    "RSC6" | u8 ver | u32 sr | u32 frame_sz | u16 n_partials |
+#    u32 total_samples | u32 total_frames | u16 mask_sz |
+#    u8 k_freq | u8 k_amp | u32 born_data_sz | u32 rice_freq_sz
+#
+#  Section 1 — Bitmasks  : nF * 2 * mask_sz  bytes
+#  Section 2 — Born data : born_data_sz       bytes  (uint16 fq + uint8 amu, uncompressed)
+#  Section 3 — Rice freq : rice_freq_sz       bytes  (zigzag+Rice(k_freq) freq deltas)
+#  Section 4 — Rice amp  : remaining          bytes  (zigzag+Rice(k_amp)  amp  deltas)
+# ─────────────────────────────────────────────────────────────
 def write_rsc(
     path: str,
-    frame_freqs: np.ndarray,   # (n_frames, n_partials) float32
-    frame_amps:  np.ndarray,   # (n_frames, n_partials) float32
-    sample_rate: int, frame_size: int, total_samples: int,
+    frame_freqs: np.ndarray,
+    frame_amps:  np.ndarray,
+    sample_rate: int,
+    frame_size:  int,
+    total_samples: int,
 ) -> None:
     n_frames, n_partials = frame_freqs.shape
-    HEADER = 23
-
-    buf = bytearray(HEADER + n_frames * n_partials * 4)
-    struct.pack_into("<4sBIIHII", buf, 0,
-                     b"RSC4", 4,
-                     sample_rate, frame_size, n_partials,
-                     total_samples, n_frames)
-
+    mask_sz    = (n_partials + 7) // 8
     freq_scale = 65535.0 / (sample_rate / 2.0)
-    f16 = np.clip(np.round(frame_freqs * freq_scale), 0, 65535).astype(np.uint16)
-    a16 = np.clip(np.round(frame_amps  * 65535.0),    0, 65535).astype(np.uint16)
 
-    f_bytes = f16.view(np.uint8).reshape(n_frames, n_partials, 2)
-    a_bytes = a16.view(np.uint8).reshape(n_frames, n_partials, 2)
+    f_q  = np.clip(np.round(frame_freqs * freq_scale), 0, 65535).astype(np.int32)
+    a_mu = _mulaw_encode(frame_amps)   # (n_frames, n_partials) uint8
 
-    buf[HEADER:] = np.concatenate([f_bytes, a_bytes], axis=2).tobytes()
+    # ── Pass 1: build bitmasks + born data + collect delta lists ─────────
+    bitmask_buf  = bytearray()
+    born_buf     = bytearray()
+    freq_deltas  = []   # list of int16 deltas for continuing partials
+    amp_deltas   = []   # list of int8  deltas for continuing partials
+
+    prev_fq   = np.zeros(n_partials, dtype=np.int32)
+    prev_amu  = np.zeros(n_partials, dtype=np.int32)
+    was_alive = np.zeros(n_partials, dtype=bool)
+    _pad_buf  = np.zeros(mask_sz * 8, dtype=np.uint8)
+
+    for i in range(n_frames):
+        alive    = frame_amps[i] > ALIVE_THRESHOLD
+        nat_born = alive & ~was_alive
+        born_bits = nat_born.copy()
+
+        for slot in np.where(alive)[0]:
+            fq  = int(f_q[i, slot])
+            amu = int(a_mu[i, slot])
+
+            if nat_born[slot]:
+                born_buf += struct.pack("<HB", fq, amu)
+            else:
+                df = fq  - prev_fq[slot]
+                da = amu - prev_amu[slot]
+                if -32768 <= df <= 32767 and -128 <= da <= 127:
+                    freq_deltas.append(df)
+                    amp_deltas.append(da)
+                else:
+                    # Overflow → rebirth
+                    born_buf += struct.pack("<HB", fq, amu)
+                    born_bits[slot] = True
+
+            prev_fq[slot]  = fq
+            prev_amu[slot] = amu
+
+        dead = was_alive & ~alive
+        prev_fq[dead]  = 0
+        prev_amu[dead] = 0
+
+        alive_pad = _pad_buf.copy(); alive_pad[:n_partials] = alive.astype(np.uint8)
+        born_pad  = _pad_buf.copy(); born_pad[:n_partials]  = born_bits.astype(np.uint8)
+        bitmask_buf += bytes(np.packbits(alive_pad, bitorder="little"))
+        bitmask_buf += bytes(np.packbits(born_pad,  bitorder="little"))
+        was_alive = alive
+
+        if (i + 1) % 500 == 0 or (i + 1) == n_frames:
+            print(f"   ... encoded frame {i+1}/{n_frames}", end="\r")
+
+    print()
+
+    # ── Pass 2: zigzag + Rice encode delta streams ────────────────────────
+    fd_arr = np.array(freq_deltas, dtype=np.int32) if freq_deltas else np.array([], dtype=np.int32)
+    ad_arr = np.array(amp_deltas,  dtype=np.int32) if amp_deltas  else np.array([], dtype=np.int32)
+
+    fd_zz  = _zigzag(fd_arr)
+    ad_zz  = _zigzag(ad_arr)
+
+    k_freq = _optimal_k(fd_zz)
+    k_amp  = _optimal_k(ad_zz)
+    print(f"   Rice k_freq={k_freq}  k_amp={k_amp}"
+          f"  |  {len(freq_deltas)} freq deltas, {len(amp_deltas)} amp deltas")
+
+    rice_freq = _rice_encode(fd_zz, k_freq)
+    rice_amp  = _rice_encode(ad_zz, k_amp)
+
+    # ── Write file ────────────────────────────────────────────────────────
+    born_data_sz  = len(born_buf)
+    rice_freq_sz  = len(rice_freq)
+
+    header = struct.pack(
+        "<4sBIIHIIHBBII",
+        b"RSC6", 6,
+        sample_rate, frame_size, n_partials,
+        total_samples, n_frames,
+        mask_sz, k_freq, k_amp,
+        born_data_sz, rice_freq_sz,
+    )
+    assert len(header) == 35, f"Header size wrong: {len(header)}"
 
     with open(path, "wb") as fh:
-        fh.write(buf)
+        fh.write(header)
+        fh.write(bitmask_buf)
+        fh.write(born_buf)
+        fh.write(rice_freq)
+        fh.write(rice_amp)
 
-    kb = len(buf) / 1024
-    print(f"  ✅ Wrote {n_frames} frames -> {path}  ({kb:.1f} KB, {kb/60:.1f} KB/s)")
+    total_sz  = len(header) + len(bitmask_buf) + born_data_sz + rice_freq_sz + len(rice_amp)
+    rsc4_sz   = 23 + n_frames * n_partials * 4
+    rsc5_sz   = 35 + len(bitmask_buf) + born_data_sz + len(freq_deltas) * 3   # approx
+    kb        = total_sz / 1024
+    saving4   = 100.0 * (1.0 - total_sz / rsc4_sz)
+    print(f"  ✅ Wrote {n_frames} frames → {path}")
+    print(f"     {kb:.1f} KB  ({saving4:.1f}% smaller than RSC4, {kb/60:.2f} KB/s avg)")
+    print(f"     Bitmasks {len(bitmask_buf)/1024:.1f} KB  |  Born {born_data_sz/1024:.1f} KB"
+          f"  |  Rice-freq {rice_freq_sz/1024:.1f} KB  |  Rice-amp {len(rice_amp)/1024:.1f} KB")
 
 
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 #  Main Encode Pipeline
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -> None:
     print(f"RSC Encoder  --  {input_path}")
     print(f"   Partials/frame : {n_partials}  |  Target SR: {target_sr} Hz")
@@ -310,7 +429,8 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
         g = gcd(target_sr, native_sr)
         samples = resample_poly(samples, target_sr // g, native_sr // g).astype(np.float32)
         peak = np.max(np.abs(samples))
-        if peak > 1e-9: samples /= peak
+        if peak > 1e-9:
+            samples /= peak
 
     sample_rate   = target_sr
     total_samples = len(samples)
@@ -347,20 +467,14 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
         prev_f     = of
         prev_a     = oa
 
-        if (i + 1) % 500 == 0 or (i + 1) == n_frames:
-            print(f"   ... encoded frame {i+1}/{n_frames}", end="\r")
-
-    print()
     write_rsc(output_path, all_f, all_a, sample_rate, frame_size, total_samples)
-    kb = (23 + n_frames * n_partials * 4) / 1024
-    print(f"   {kb:.1f} KB  ({kb/1024:.3f} MB)  |  Done!")
 
 
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 #  CLI
-# ---------------------------------------------
+# ─────────────────────────────────────────────────────────────
 def main():
-    p = argparse.ArgumentParser(description="RSC Encoder",
+    p = argparse.ArgumentParser(description="RSC6 Encoder",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--input",      "-i", required=True)
     p.add_argument("--output",     "-o", default=None)
