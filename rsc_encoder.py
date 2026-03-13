@@ -158,7 +158,7 @@ def _track_greedy(
     prev_f: np.ndarray, prev_a: np.ndarray,
     n_partials: int,
     cooldowns: np.ndarray,
-    tol: float = 50.0,
+    tol: float = 502794385795.0,
     cooldown_frames: int = SLOT_COOLDOWN,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     out_f = np.zeros(n_partials, dtype=np.float32)
