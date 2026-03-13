@@ -2,11 +2,11 @@
 rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder  [optimized]
 
 Format: RSC4
-  Header : 23 bytes  (magic changed RSC3→RSC4, layout identical)
+  Header : 23 bytes  (magic RSC4, layout identical to RSC3)
   Partial: 4 bytes   uint16 freq | uint16 amp
            (phase removed — decoder simulates phase continuously)
 
-Usage:
+Usage:   
     python rsc_encoder.py --input audio.wav --output audio.rsc
     python rsc_encoder.py --input audio.wav --output audio.rsc --partials 384 --samplerate 44100
 """
@@ -29,7 +29,7 @@ DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 4096     # ~10.8 Hz/bin at 44100
-SLOT_COOLDOWN      = 4        # frames a slot must wait after death before reuse
+SLOT_COOLDOWN      = 0        # frames a slot must wait after death before reuse
 
 
 # ---------------------------------------------
@@ -69,6 +69,7 @@ def load_wav(path: str) -> tuple[np.ndarray, int]:
 # ---------------------------------------------
 class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN, NW: float = 4.0):
+
         self.win       = analysis_win
         self.sr        = sample_rate
 
@@ -127,68 +128,119 @@ def _fft_candidates(
         # Fallback: very flat frame — take top n_candidates by HFC directly
         peak_idx = np.argpartition(hfc_scores, -n_candidates)[-n_candidates:]
 
-    # ─── Sort peaks by HFC descending, oversample exactly 2× ───
-    peak_hfc   = hfc_scores[peak_idx]
-    sort_order = np.argsort(peak_hfc)[::-1]
-    oversampled = peak_idx[sort_order][:n_candidates * 2]
+    # ─── Sort peaks by HFC descending ───
+    peak_hfc      = hfc_scores[peak_idx]
+    sort_order    = np.argsort(peak_hfc)[::-1]
+    sorted_idx    = peak_idx[sort_order]
+    n_peaks_total = len(sorted_idx)
+
+    # ─── Dynamic oversampling — scales with spectral density ───
+    if n_peaks_total <= n_candidates:
+        oversample_factor = 1.0
+    else:
+        loudest           = peak_hfc[sort_order[0]] + 1e-12
+        relative_strength = peak_hfc[sort_order] / loudest
+        cum_energy        = np.cumsum(relative_strength)
+        knee_idx          = np.searchsorted(cum_energy, 0.80 * cum_energy[-1])
+        significant_count = max(n_candidates, knee_idx + 1)
+        n_top             = min(n_candidates * 2, n_peaks_total // 2 + 1)
+        top_energy_ratio  = np.sum(peak_hfc[sort_order[:n_top]]) / (np.sum(peak_hfc) + 1e-12)
+        spread_factor     = 1.0 / (top_energy_ratio + 0.05)
+        crowd_pressure    = (significant_count / n_candidates) * spread_factor
+        oversample_factor = 1.0 + crowd_pressure
+
+    n_take      = min(n_peaks_total, int(n_candidates * oversample_factor + 0.5))
+    n_take      = max(n_take, min(n_candidates, n_peaks_total))
+    oversampled = sorted_idx[:n_take]
 
     # ─── Freq filter (20 Hz – nyquist) ───
     f    = state.freqs[oversampled]
     mask = (f >= 20.0) & (f <= state.nyquist - state.bin_width)
-    top  = oversampled[mask][:n_candidates]
+    top  = oversampled[mask]
 
-    # ─── Fallback: freq filter ate too many peaks ───
+    # ─── Fallback if filter ate too many (now very rare) ───
     if len(top) < n_candidates:
         extra_needed = n_candidates - len(top)
-        # Start after the full oversample window to avoid duplicates
-        remaining = peak_idx[sort_order][n_candidates * 2:]
-        extra     = remaining[:extra_needed]
-        top       = np.concatenate([top, extra])
+        remaining    = sorted_idx[n_take:]
+        extra        = remaining[:min(extra_needed, len(remaining))]
+        top          = np.concatenate([top, extra])
 
-    ca = np.clip(mags[top], 0.0, 1.0)
-
-    return state.freqs[top], ca
+    return state.freqs[top], np.clip(mags[top], 0.0, 1.0)
 
 
 # ---------------------------------------------
-#  Greedy Peak Tracker  (with slot cooldown)
+#  Greedy Peak Tracker
+#  2nd-order prediction + perceptual adaptive tolerance + slot cooldown
 # ---------------------------------------------
 def _track_greedy(
     cand_f: np.ndarray, cand_a: np.ndarray,
     prev_f: np.ndarray, prev_a: np.ndarray,
+    prevprev_f: np.ndarray,                  # two frames back — needed for acceleration
     n_partials: int,
     cooldowns: np.ndarray,
-    tol: float = 502794385795.0,
     cooldown_frames: int = SLOT_COOLDOWN,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
 
-    # Tick down all cooldowns at the top of every frame
     cooldowns = np.maximum(0, cooldowns - 1)
 
     if len(cand_f) == 0:
         return out_f, out_a, cooldowns
 
     claimed = np.zeros(len(cand_f), dtype=bool)
-
-    # Continue active partials first (sorted highest amp first)
-    active = np.where(prev_a > 1e-6)[0]
-    active = active[np.argsort(prev_a[active])[::-1]]
+    active  = np.where(prev_a > 1e-6)[0]
+    active  = active[np.argsort(prev_a[active])[::-1]]
 
     for slot in active:
         if claimed.all(): break
-        dists = np.where(~claimed, np.abs(cand_f - prev_f[slot]), np.inf)
+
+        # ── 1. 2nd-order prediction (acceleration-aware) ──────────────────
+        if prevprev_f[slot] > 1e-3:
+            predicted_f = 2.0 * prev_f[slot] - prevprev_f[slot]
+            delta = abs(predicted_f - prev_f[slot])
+            if delta > 400 or not (20 < predicted_f < 22050):
+                predicted_f = prev_f[slot]   # degenerate — fall back to 1st order
+        else:
+            predicted_f = prev_f[slot]
+
+        search_center = predicted_f
+
+        # ── 2. Base tolerance: relative cents + ERB floor ─────────────────
+        cents_base = search_center * 0.038          # ~46 cents
+        erb_floor  = 24.7 + 0.108 * search_center   # true ERB formula
+        tol        = max(cents_base, erb_floor * 0.55)
+
+        # ── 3. Find nearest unclaimed candidate to search_center ──────────
+        dists = np.where(~claimed, np.abs(cand_f - search_center), np.inf)
         bi    = int(np.argmin(dists))
-        if dists[bi] <= tol:
+
+        # ── 4. Asymmetric allowance ───────────────────────────────────────
+        if cand_f[bi] > search_center:
+            tol *= 1.25   # +25% upward stretch
+        else:
+            tol *= 0.85   # tighter downward
+
+        # ── 5. Amplitude confidence multiplier ───────────────────────────
+        amp_conf = float(np.interp(prev_a[slot],
+                                   [0.03, 0.15, 0.6, 1.0],
+                                   [0.5,  0.8,  1.2, 1.6]))
+        tol *= amp_conf
+
+        # ── 6. Velocity / instability boost ──────────────────────────────
+        recent_delta   = abs(prev_f[slot] - prevprev_f[slot]) if prevprev_f[slot] > 1e-3 else 0.0
+        velocity_boost = min(2.0, 1.0 + recent_delta / 80.0)
+        tol *= velocity_boost
+
+        # ── 7. Soft gate at 1.8× tol ─────────────────────────────────────
+        if dists[bi] <= tol * 1.8:
             out_f[slot] = cand_f[bi]
             out_a[slot] = cand_a[bi]
             claimed[bi] = True
         else:
-            # Partial died — lock slot before reuse
-            cooldowns[slot] = cooldown_frames
+            cooldowns[slot] = cooldown_frames   # partial died
 
-    # Assign unclaimed births to empty cooled-down slots only
+    # ── Birth assignment: unclaimed → empty cooled-down slots ────────────
     births = np.where(~claimed)[0]
     if len(births):
         births   = births[np.argsort(cand_a[births])[::-1]]
@@ -206,9 +258,9 @@ def _track_greedy(
 
 # ---------------------------------------------
 #  RSC4 Binary Writer
-#  Header : 23 bytes  (identical layout to RSC3, magic = "RSC4")
+#  Header : 23 bytes  (magic = "RSC4", layout identical to RSC3)
 #  Partial: 4 bytes   uint16 freq | uint16 amp
-#           (phase removed — saves 2 bytes/partial/frame = 33% smaller files)
+#           (phase removed — 33% smaller than RSC3)
 # ---------------------------------------------
 def write_rsc(
     path: str,
@@ -273,26 +325,28 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
           f"  |  {n_frames} frames")
 
     state  = AnalysisState(sample_rate)
-    n_cand = min(n_partials * 2, 768)
+    n_cand = ANALYSIS_WIN // 2 
     print(f"   Analysis win   : {ANALYSIS_WIN} samp  ({state.bin_width:.1f} Hz/bin)"
           f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN} frames")
 
     all_f = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
 
-    prev_f    = np.zeros(n_partials, dtype=np.float32)
-    prev_a    = np.zeros(n_partials, dtype=np.float32)
-    cooldowns = np.zeros(n_partials, dtype=np.int32)
+    prev_f     = np.zeros(n_partials, dtype=np.float32)
+    prev_a     = np.zeros(n_partials, dtype=np.float32)
+    prevprev_f = np.zeros(n_partials, dtype=np.float32)
+    cooldowns  = np.zeros(n_partials, dtype=np.int32)
 
     for i in range(n_frames):
-        center             = i * frame_size + frame_size // 2
-        cf, ca             = _fft_candidates(samples, center, state, n_cand)
-        of, oa, cooldowns  = _track_greedy(cf, ca, prev_f, prev_a,
-                                            n_partials, cooldowns)
-        all_f[i] = of
-        all_a[i] = oa
-        prev_f   = of
-        prev_a   = oa
+        center            = i * frame_size + frame_size // 2
+        cf, ca            = _fft_candidates(samples, center, state, n_cand)
+        of, oa, cooldowns = _track_greedy(cf, ca, prev_f, prev_a, prevprev_f,
+                                           n_partials, cooldowns)
+        all_f[i]   = of
+        all_a[i]   = oa
+        prevprev_f = prev_f
+        prev_f     = of
+        prev_a     = oa
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
             print(f"   ... encoded frame {i+1}/{n_frames}", end="\r")
