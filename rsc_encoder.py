@@ -211,12 +211,6 @@ def _fft_candidates(
     n_take = max(n_take, min(n_candidates, n_peaks_total))
 
     # ── Quadratic peak interpolation (vectorized) ─────────────────────────
-    # Parabola through (k-1, k, k+1):
-    #   offset   = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
-    #   f_true   = (k + offset) * bin_width
-    #   amp_true = beta - 0.25 * (alpha - gamma) * offset   ← apex magnitude
-    # Using the apex magnitude rather than raw mags[k] is the key fix for
-    # amplitude flickering — it's ~3-5× stabler on steady tones.
     def _interpolate(idx_arr):
         idx      = idx_arr.astype(np.int32)
         ref_bins = idx.astype(np.float64)
@@ -235,7 +229,6 @@ def _fft_candidates(
             offset[safe] = 0.5 * (alpha[safe] - gamma[safe]) / denom[safe]
 
             ref_bins[valid] = k + offset
-            # Apex amplitude — stabler than raw bin value
             ref_mags[valid] = beta - 0.25 * (alpha - gamma) * offset
 
         return ref_bins * state.bin_width, ref_mags   # Hz, amplitude
@@ -247,7 +240,6 @@ def _fft_candidates(
     top_freqs = pool_freqs[mask].astype(np.float32)
     top_mags  = pool_amps[mask].astype(np.float32)
 
-    # Fallback: freq filter ate too many
     if len(top_freqs) < n_candidates:
         extra_needed  = n_candidates - len(top_freqs)
         remaining_idx = sorted_idx[n_take:]
@@ -359,7 +351,6 @@ def write_rsc(
     prev_fq   = np.zeros(n_partials, dtype=np.int32)
     prev_amu  = np.zeros(n_partials, dtype=np.int32)
     was_alive = np.zeros(n_partials, dtype=bool)
-    _pad_buf  = np.zeros(mask_sz * 8, dtype=np.uint8)
 
     for i in range(n_frames):
         alive    = frame_amps[i] > ALIVE_THRESHOLD
@@ -390,8 +381,10 @@ def write_rsc(
         prev_fq[dead]  = 0
         prev_amu[dead] = 0
 
-        alive_pad = _pad_buf.copy(); alive_pad[:n_partials] = alive.astype(np.uint8)
-        born_pad  = _pad_buf.copy(); born_pad[:n_partials]  = born_bits.astype(np.uint8)
+        # Allocate fresh zero buffers every frame so tail bits [n_partials:mask_sz*8]
+        # are always 0 and never carry stale data from a previous frame.
+        alive_pad = np.zeros(mask_sz * 8, dtype=np.uint8); alive_pad[:n_partials] = alive.astype(np.uint8)
+        born_pad  = np.zeros(mask_sz * 8, dtype=np.uint8); born_pad[:n_partials]  = born_bits.astype(np.uint8)
         bitmask_buf += bytes(np.packbits(alive_pad, bitorder="little"))
         bitmask_buf += bytes(np.packbits(born_pad,  bitorder="little"))
         was_alive = alive
@@ -481,9 +474,6 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
 
     state  = AnalysisState(sample_rate)
 
-    # Cap n_partials to what find_peaks can realistically return.
-    # With ANALYSIS_WIN=4096 and min_dist≈2, find_peaks returns ~500-800 peaks max.
-    # Asking for more just fills slots with leakage garbage — sounds awful.
     max_meaningful = int(state.nyquist / state.bin_width / state.min_dist)
     if n_partials > max_meaningful:
         print(f"   ⚠  Clamping partials {n_partials} → {max_meaningful} "
