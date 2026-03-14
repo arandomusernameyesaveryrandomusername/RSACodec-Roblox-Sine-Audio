@@ -30,11 +30,11 @@ from scipy.signal import find_peaks, windows
 #  Constants
 # ─────────────────────────────────────────────────────────────
 TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 384
+DEFAULT_PARTIALS   = 64
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 4096
-SLOT_COOLDOWN      = 4
+SLOT_COOLDOWN      = 1
 MU                 = 255.0
 ALIVE_THRESHOLD    = 1e-4
 _LOG1P_MU          = math.log1p(MU)

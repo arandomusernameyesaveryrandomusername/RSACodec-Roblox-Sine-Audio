@@ -15,15 +15,6 @@ import wave
 import numpy as np
 
 TWO_PI    = 2.0 * math.pi
-MU        = 255.0
-_LOG1P_MU = math.log1p(MU)
-
-
-# ─────────────────────────────────────────────────────────────
-#  Mu-law decode
-# ─────────────────────────────────────────────────────────────
-def _mulaw_decode_scalar(y: int) -> float:
-    return math.expm1(y / MU * _LOG1P_MU) / MU
 
 
 # ─────────────────────────────────────────────────────────────
@@ -145,7 +136,7 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray]:
                 curr_amu[slot] += amp_reader.read_rice(k_amp)
 
             freqs[i, slot] = curr_fq[slot]  * freq_scale
-            amps[i, slot]  = _mulaw_decode_scalar(curr_amu[slot])
+            amps[i, slot]  = curr_amu[slot] / 255.0
 
         if (i + 1) % 500 == 0 or (i + 1) == total_frames:
             print(f"   ... parsed frame {i+1}/{total_frames}", end="\r")
