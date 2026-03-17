@@ -14,6 +14,7 @@ import wave
 
 import numpy as np
 from scipy.signal import find_peaks, windows
+import librosa
 
 
 # ─────────────────────────────────────────────────────────────
@@ -104,34 +105,15 @@ def _rice_encode(vals: np.ndarray, k: int) -> bytearray:
 # ─────────────────────────────────────────────────────────────
 #  WAV Loading
 # ─────────────────────────────────────────────────────────────
-def load_wav(path: str) -> tuple[np.ndarray, int]:
-    with wave.open(path, "rb") as wf:
-        n_channels  = wf.getnchannels()
-        sampwidth   = wf.getsampwidth()
-        sample_rate = wf.getframerate()
-        raw         = wf.readframes(wf.getnframes())
 
-    if sampwidth == 1:
-        s = (np.frombuffer(raw, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
-    elif sampwidth == 2:
-        s = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-    elif sampwidth == 3:
-        b = np.frombuffer(raw, dtype=np.uint8)
-        i = (b[0::3].astype(np.int32) | (b[1::3].astype(np.int32) << 8) |
-             (b[2::3].astype(np.int32) << 16))
-        i[i >= 0x800000] -= 0x1000000
-        s = i.astype(np.float32) / 8388608.0
-    elif sampwidth == 4:
-        s = np.frombuffer(raw, dtype=np.int32).astype(np.float32) / 2147483648.0
-    else:
-        raise ValueError(f"Unsupported sample width: {sampwidth}")
-
-    if n_channels > 1:
-        s = s.reshape(-1, n_channels).mean(axis=1)
-    peak = np.max(np.abs(s))
+def load_audio(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
+    # y: float32 array, sr: sample rate
+    y, sr = librosa.load(path, sr=target_sr, mono=True)  # auto-resamples & mono
+    # normalize to [-1, 1]
+    peak = np.max(np.abs(y))
     if peak > 1e-9:
-        s /= peak
-    return s, sample_rate
+        y = y / peak
+    return y.astype(np.float32), target_sr
 
 
 # ─────────────────────────────────────────────────────────────
@@ -440,7 +422,7 @@ def encode(input_path: str, output_path: str, n_partials: int, target_sr: int) -
     print(f"RSC Encoder  --  {input_path}")
     print(f"   Partials/frame : {n_partials}  |  Target SR: {target_sr} Hz")
 
-    samples, native_sr = load_wav(input_path)
+    samples, native_sr = load_audio(input_path, target_sr)
     print(f"   Native SR      : {native_sr} Hz  |  {len(samples)} samples  "
           f"({len(samples)/native_sr:.2f}s)")
 
