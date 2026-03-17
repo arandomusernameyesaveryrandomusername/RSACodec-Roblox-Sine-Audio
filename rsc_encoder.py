@@ -197,7 +197,7 @@ def _fft_candidates(
             denom = alpha - 2.0 * beta + gamma
             safe  = np.abs(denom) > 1e-12
 
-            offset = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
+            offset = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma + 1e-12)
             offset[safe] = 0.5 * (alpha[safe] - gamma[safe]) / denom[safe]
 
             ref_bins[valid] = k + offset
