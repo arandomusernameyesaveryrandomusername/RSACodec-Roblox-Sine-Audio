@@ -1,17 +1,7 @@
 """
 rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder
 
-Format: RSC6
-  Header  : 35 bytes
-  Sections (in order):
-    1. Bitmasks   : nF * 2 * mask_sz bytes  (alive_mask + born_mask per frame, uncompressed)
-    2. Born data  : born_data_sz bytes       (uint16 freq_q + uint8 amp_mu per born partial)
-    3. Freq deltas: rice_freq_sz bytes       (zigzag + Rice(k_freq) coded int16 freq deltas)
-    4. Amp deltas : remaining bytes          (zigzag + Rice(k_amp)  coded int8  amp deltas)
-
-  Phase not stored — decoder accumulates continuously.
-  Alive/continuing partial data costs ~2-4 bits/value after Rice coding.
-
+d
 Usage:
     python rsc_encoder.py --input audio.wav --output audio.rsc
     python rsc_encoder.py --input audio.wav --output audio.rsc --partials 384 --samplerate 44100
@@ -30,13 +20,13 @@ from scipy.signal import find_peaks, windows
 #  Constants
 # ─────────────────────────────────────────────────────────────
 TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 64
+DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 4096
 SLOT_COOLDOWN      = 1
 MU                 = 255.0
-ALIVE_THRESHOLD    = 1e-4
+ALIVE_THRESHOLD    = 0
 _LOG1P_MU          = math.log1p(MU)
 
 
