@@ -1,0 +1,8 @@
+audio.mp3
+# Python virtualenv
+venv/
+.venv/
+.env/
+__pycache__/
+*.pyc
+*.pyo
