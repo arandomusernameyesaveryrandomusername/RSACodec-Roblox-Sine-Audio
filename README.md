@@ -6,6 +6,7 @@ Audio Codec 4 Roblox :P
 | Version | Supported          |
 | ------- | ------------------ |
 | latest |yes |
+|older|no
 
 Vibe Coded
 
