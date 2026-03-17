@@ -1,4 +1,9 @@
-audio.mp3
+*.mp3
+*.wav
+*.flac
+*.ogg
+*.aac
+*.m4a
 # Python virtualenv
 venv/
 .venv/
