@@ -209,17 +209,17 @@ def _fft_candidates(
         valid = (idx >= 1) & (idx < len(mags) - 1)
         if valid.any():
             k     = idx[valid]
-            alpha = mags[k - 1].astype(np.float64)
-            beta  = mags[k    ].astype(np.float64)
-            gamma = mags[k + 1].astype(np.float64)
+            alpha = np.log(mags[k - 1] + 1e-12)
+            beta  = np.log(mags[k]     + 1e-12)
+            gamma = np.log(mags[k + 1] + 1e-12)
             denom = alpha - 2.0 * beta + gamma
             safe  = np.abs(denom) > 1e-12
 
-            offset = np.zeros(valid.sum(), dtype=np.float64)
+            offset = 0.5 * (alpha - gamma) / (alpha - 2*beta + gamma)
             offset[safe] = 0.5 * (alpha[safe] - gamma[safe]) / denom[safe]
 
             ref_bins[valid] = k + offset
-            ref_mags[valid] = beta - 0.25 * (alpha - gamma) * offset
+            ref_mags[valid] = np.exp(beta - 0.25 * (alpha - gamma) * offset)
 
         return ref_bins * state.bin_width, ref_mags   # Hz, amplitude
 
@@ -267,10 +267,13 @@ def _track_greedy(
     for slot in active:
         if claimed.all(): break
 
-        if prevprev_f[slot] > 1e-3:
-            predicted_f = 2.0 * prev_f[slot] - prevprev_f[slot]
-            if abs(predicted_f - prev_f[slot]) > 400 or not (20 < predicted_f < 22050):
-                predicted_f = prev_f[slot]
+        if prevprev_f[slot] > 20.0 and prev_f[slot] > 20.0:
+            confidence = np.clip(prev_a[slot], 0.0, 1.0)
+            log_prev     = np.log(prev_f[slot])
+            log_prevprev = np.log(prevprev_f[slot])
+
+            log_velocity = (log_prev - log_prevprev) * confidence
+            predicted_f  = np.exp(log_prev + log_velocity)
         else:
             predicted_f = prev_f[slot]
 
