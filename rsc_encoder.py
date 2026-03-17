@@ -133,33 +133,6 @@ class AnalysisState:
         self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
         self.erb       = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
 
-# LPC-based frequency predictor for greedy tracker (can be extended to use longer history)
-import numpy as np
-from scipy.linalg import lstsq
-
-def lpc_predict(prev_f_vals: np.ndarray, order: int = 4) -> float:
-    """
-    Predict next value using simple linear predictive coding (LPC).
-    prev_f_vals : array of previous values (at least 'order' long)
-    order       : number of previous samples to consider
-    """
-    n = len(prev_f_vals)
-    if n < order:
-        # Not enough history, fallback to last value
-        return prev_f_vals[-1]
-
-    # Build Toeplitz matrix for linear prediction
-    X = np.stack([prev_f_vals[i:n - order + i] for i in range(order)], axis=1)
-    y = prev_f_vals[order:]
-
-    # Solve linear system for LPC coefficients
-    coeffs, _, _, _ = lstsq(X, y)
-
-    # Predict next sample
-    last_vals = prev_f_vals[-order:]
-    predicted = np.dot(last_vals, coeffs)
-    return predicted
-
 
 # ─────────────────────────────────────────────────────────────
 #  FFT Candidate Extraction
@@ -278,12 +251,12 @@ def _track_greedy(
         if claimed.all(): break
 
         if prevprev_f[slot] > 20.0 and prev_f[slot] > 20.0:
-            # history buffer (last 4 frames)
-            history = np.array([prevprev_f[slot], prev_f[slot]])  # extend later if you keep longer
-            # Predicted frequency from LPC
-            predicted_f_lpc = lpc_predict(history, order=min(4, len(history)))
-            # Blend with the previous frame’s frequency
-            predicted_f = 0.8 * predicted_f_lpc + 0.2 * prev_f[slot]
+            confidence = np.clip(prev_a[slot], 0.0, 1.0)
+            log_prev     = np.log(prev_f[slot])
+            log_prevprev = np.log(prevprev_f[slot])
+
+            log_velocity = (log_prev - log_prevprev) * confidence
+            predicted_f  = np.exp(log_prev + log_velocity)
         else:
             predicted_f = prev_f[slot]
 
