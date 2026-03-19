@@ -1,35 +1,35 @@
+from __future__ import annotations
 """
 rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder
+Format: RSC7 (RSC6 + ERB residual band envelope)
 
 Usage:
     python rsc_encoder.py --input audio.wav --output audio.rsc
     python rsc_encoder.py --input audio.wav --output audio.rsc --partials 384 --samplerate 44100 --workers 4
 """
-
 import argparse
 import math
 import os
 import struct
 import librosa
 from concurrent.futures import ThreadPoolExecutor
-
 import numpy as np
 from scipy.signal import find_peaks, windows
-
 
 # ─────────────────────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────────────────────
-TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 384
-DEFAULT_SAMPLERATE = 44100
-RSC_EXTENSION      = ".rsc"
-ANALYSIS_WIN       = 4096
-SLOT_COOLDOWN      = 1
-MU                 = 255.0
-ALIVE_THRESHOLD    = 0
-_LOG1P_MU          = math.log1p(MU)
-
+TARGET_FPS           = 60
+DEFAULT_PARTIALS     = 384
+DEFAULT_SAMPLERATE   = 44100
+RSC_EXTENSION        = ".rsc"
+ANALYSIS_WIN         = 4096
+SLOT_COOLDOWN        = 1
+MU                   = 255.0
+ALIVE_THRESHOLD      = 0
+N_RESIDUAL_BANDS     = 128          # ERB bands for residual envelope
+TWO_PI               = 2.0 * math.pi
+_LOG1P_MU            = math.log1p(MU)
 
 # ─────────────────────────────────────────────────────────────
 #  Mu-law
@@ -39,7 +39,6 @@ def _mulaw_encode(x: np.ndarray) -> np.ndarray:
     x = np.clip(x.astype(np.float64), 0.0, 1.0)
     return np.clip(np.round(MU * np.log1p(MU * x) / _LOG1P_MU), 0, 255).astype(np.uint8)
 
-
 # ─────────────────────────────────────────────────────────────
 #  Rice helpers
 # ─────────────────────────────────────────────────────────────
@@ -47,7 +46,6 @@ def _zigzag(arr: np.ndarray) -> np.ndarray:
     """signed int32 → non-negative uint32  (0→0, -1→1, 1→2, -2→3, …)"""
     a = arr.astype(np.int32)
     return ((a << 1) ^ (a >> 31)).astype(np.uint32)
-
 
 def _optimal_k(vals: np.ndarray) -> int:
     """Brute-force optimal Rice parameter k in [0, 15]."""
@@ -62,7 +60,6 @@ def _optimal_k(vals: np.ndarray) -> int:
             best_bits, best_k = bits, k
     return best_k
 
-
 def _rice_encode(vals: np.ndarray, k: int) -> bytearray:
     """
     Vectorised Rice encoder — MSB-first bit packing.
@@ -73,46 +70,35 @@ def _rice_encode(vals: np.ndarray, k: int) -> bytearray:
     n = len(vals)
     if n == 0:
         return bytearray()
-
     v64        = vals.astype(np.int64)
     quotients  = v64 >> k
     remainders = v64 & ((1 << k) - 1)
     code_lens  = quotients + 1 + k
     total_bits = int(code_lens.sum())
-
     bits   = np.zeros(total_bits, dtype=np.uint8)
     starts = np.empty(n, dtype=np.int64)
     starts[0] = 0
     if n > 1:
         starts[1:] = np.cumsum(code_lens[:-1])
-
     bits[(starts + quotients).astype(int)] = 1
-
     for bit_idx in range(k):
         shift     = k - 1 - bit_idx
         positions = (starts + quotients + 1 + bit_idx).astype(int)
         bits[positions] = ((remainders >> shift) & 1).astype(np.uint8)
-
     pad = (-total_bits) % 8
     if pad:
         bits = np.append(bits, np.zeros(pad, dtype=np.uint8))
     return bytearray(np.packbits(bits, bitorder="big"))
 
-
 # ─────────────────────────────────────────────────────────────
 #  WAV Loading
 # ─────────────────────────────────────────────────────────────
-
-
 def load_audio(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
-    # y: float32 array, sr: sample rate
-    y, sr = librosa.load(path, sr=target_sr, mono=True)  # auto-resamples & mono
-    # normalize to [-1, 1]
+    y, sr = librosa.load(path, sr=target_sr, mono=True)
     peak = np.max(np.abs(y))
-    y = y / peak
+    if peak > 1e-9:
+        y = y / peak
     return y.astype(np.float32), target_sr
-
-
 
 # ─────────────────────────────────────────────────────────────
 #  Analysis State
@@ -130,9 +116,8 @@ class AnalysisState:
         self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
         self.erb       = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
 
-
 # ─────────────────────────────────────────────────────────────
-#  Parabolic Peak Interpolation (module-level — no closure overhead)
+#  Parabolic Peak Interpolation
 # ─────────────────────────────────────────────────────────────
 def _parabolic_interp(
     idx_arr: np.ndarray,
@@ -143,7 +128,6 @@ def _parabolic_interp(
     idx      = idx_arr.astype(np.int32)
     ref_bins = idx.astype(np.float64)
     ref_mags = mags[idx].astype(np.float64)
-
     valid = (idx >= 1) & (idx < len(mags) - 1)
     if valid.any():
         k     = idx[valid]
@@ -152,15 +136,11 @@ def _parabolic_interp(
         gamma = mags[k + 1].astype(np.float64)
         denom = alpha - 2.0 * beta + gamma
         safe  = np.abs(denom) > 1e-12
-
         offset = np.zeros(valid.sum(), dtype=np.float64)
         offset[safe] = 0.5 * (alpha[safe] - gamma[safe]) / denom[safe]
-
         ref_bins[valid] = k + offset
         ref_mags[valid] = beta - 0.25 * (alpha - gamma) * offset
-
     return ref_bins * bin_width, ref_mags
-
 
 # ─────────────────────────────────────────────────────────────
 #  FFT Candidate Extraction
@@ -174,28 +154,23 @@ def _fft_candidates(
     half = state.win // 2
     s, e = center - half, center + half
     n    = len(audio)
-
     if s < 0 or e > n:
-        # state.pad_buf is read-only here — safe for concurrent use
         chunk = state.pad_buf.copy()
         ss, se = max(0, s), min(n, e)
         chunk[ss - s : ss - s + (se - ss)] = audio[ss:se]
     else:
         chunk = audio[s:e]
-
     spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
     hfc   = mags**2 * state.erb
-
     peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)
     if len(peak_idx) == 0:
-        peak_idx = np.argpartition(hfc, -n_candidates)[-n_candidates:]
-
+        k_part   = min(n_candidates, len(hfc))
+        peak_idx = np.argpartition(hfc, -k_part)[-k_part:]
     peak_hfc      = hfc[peak_idx]
     sort_order    = np.argsort(peak_hfc)[::-1]
     sorted_idx    = peak_idx[sort_order]
     n_peaks_total = len(sorted_idx)
-
     if n_peaks_total <= n_candidates:
         oversample_factor = 1.0
     else:
@@ -208,27 +183,21 @@ def _fft_candidates(
         top_ratio         = np.sum(peak_hfc[sort_order[:n_top]]) / (np.sum(peak_hfc) + 1e-12)
         spread            = 1.0 / (top_ratio + 0.05)
         oversample_factor = 1.0 + (sig / n_candidates) * spread
-
     n_take = min(n_peaks_total, int(n_candidates * oversample_factor + 0.5))
     n_take = max(n_take, min(n_candidates, n_peaks_total))
-
     pool_freqs, pool_amps = _parabolic_interp(sorted_idx[:n_take], mags, state.bin_width)
-
     mask      = (pool_freqs >= 20.0) & (pool_freqs <= state.nyquist - state.bin_width)
     top_freqs = pool_freqs[mask].astype(np.float32)
     top_mags  = pool_amps[mask].astype(np.float32)
-
     if len(top_freqs) < n_candidates:
         extra_needed  = n_candidates - len(top_freqs)
         remaining_idx = sorted_idx[n_take:]
         if len(remaining_idx) > 0:
             rem_freqs, rem_amps = _parabolic_interp(remaining_idx, mags, state.bin_width)
-            rem_mask   = (rem_freqs >= 20.0) & (rem_freqs <= state.nyquist - state.bin_width)
-            top_freqs  = np.concatenate([top_freqs, rem_freqs[rem_mask][:extra_needed].astype(np.float32)])
-            top_mags   = np.concatenate([top_mags,  rem_amps[rem_mask][:extra_needed].astype(np.float32)])
-
+            rem_mask  = (rem_freqs >= 20.0) & (rem_freqs <= state.nyquist - state.bin_width)
+            top_freqs = np.concatenate([top_freqs, rem_freqs[rem_mask][:extra_needed].astype(np.float32)])
+            top_mags  = np.concatenate([top_mags,  rem_amps[rem_mask][:extra_needed].astype(np.float32)])
     return top_freqs, np.clip(top_mags, 0.0, 1.0)
-
 
 # ─────────────────────────────────────────────────────────────
 #  Greedy Peak Tracker
@@ -244,38 +213,29 @@ def _track_greedy(
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
     cooldowns = np.maximum(0, cooldowns - 1)
-
     if len(cand_f) == 0:
         return out_f, out_a, cooldowns
-
     claimed = np.zeros(len(cand_f), dtype=bool)
     active  = np.where(prev_a > 0)[0]
     active  = active[np.argsort(prev_a[active])[::-1]]
-
     for slot in active:
         if claimed.all():
             break
-
-
-        predicted_f = prev_f[slot]
-
-        sc            = predicted_f
-        tol           = max(sc * 0.038, (24.7 + 0.108 * sc) * 0.55)
-        dists         = np.where(~claimed, np.abs(cand_f - sc), np.inf)
-        bi            = int(np.argmin(dists))
-        tol          *= 1.25 if cand_f[bi] > sc else 0.85
-        eps = 1e-12  # avoid log(0)
-        tol *= 1 - np.log1p(prev_a[slot] + eps)/np.log1p(9 + eps)
-        tol          *= min(2.0, 1.0 + (abs(prev_f[slot] - prevprev_f[slot])
-                             if prevprev_f[slot] > 1e-3 else 0.0) / 80.0)
-
+        sc    = prev_f[slot]
+        tol   = max(sc * 0.038, (24.7 + 0.108 * sc) * 0.55)
+        dists = np.where(~claimed, np.abs(cand_f - sc), np.inf)
+        bi    = int(np.argmin(dists))
+        tol  *= 1.25 if cand_f[bi] > sc else 0.85
+        eps   = 1e-12
+        tol  *= 1 - np.log1p(prev_a[slot] + eps) / np.log1p(9 + eps)
+        tol  *= min(2.0, 1.0 + (abs(prev_f[slot] - prevprev_f[slot])
+                    if prevprev_f[slot] > 1e-3 else 0.0) / 80.0)
         if dists[bi] <= tol * 1.8:
             out_f[slot] = cand_f[bi]
             out_a[slot] = cand_a[bi]
             claimed[bi] = True
         else:
             cooldowns[slot] = cooldown_frames
-
     births = np.where(~claimed)[0]
     if len(births):
         births   = births[np.argsort(cand_a[births])[::-1]]
@@ -286,124 +246,196 @@ def _track_greedy(
         sl, bi_v = empty[:n_assign][mask], bi_valid[mask]
         out_f[sl] = cand_f[bi_v]
         out_a[sl] = cand_a[bi_v]
-
     return out_f, out_a, cooldowns
 
+# ─────────────────────────────────────────────────────────────
+#  Fast sine resynthesis  (for residual computation)
+#
+#  Phase logic must stay identical to the decoder's synthesize().
+# ─────────────────────────────────────────────────────────────
+def _synthesize_fast(
+    all_f: np.ndarray,
+    all_a: np.ndarray,
+    frame_size: int,
+    sample_rate: int,
+) -> np.ndarray:
+    n_frames, n_partials = all_f.shape
+    output = np.zeros(frame_size * n_frames, dtype=np.float64)
+    t      = np.arange(frame_size, dtype=np.float64) / sample_rate
+    phi    = np.zeros(n_partials, dtype=np.float64)
+    for i in range(n_frames):
+        f      = all_f[i].astype(np.float64)
+        a      = all_a[i].astype(np.float64)
+        active = a > 1e-6
+        if active.any():
+            fa = f[active]; aa = a[active]; pa = phi[active]
+            output[i * frame_size : (i + 1) * frame_size] = (
+                aa[:, None] * np.sin(TWO_PI * fa[:, None] * t + pa[:, None])
+            ).sum(axis=0)
+        phi = (phi + TWO_PI * f * frame_size / sample_rate) % TWO_PI
+        phi[~active] = 0.0
+        if (i + 1) % 500 == 0 or (i + 1) == n_frames:
+            print(f"   ... resynth frame {i+1}/{n_frames}", end="\r")
+    print()
+    return output.astype(np.float32)
 
 # ─────────────────────────────────────────────────────────────
-#  RSC6 Binary Writer
+#  ERB residual band encoding
+# ─────────────────────────────────────────────────────────────
+def _erb_band_bins(
+    frame_size: int,
+    sample_rate: int,
+    n_bands: int,
+) -> list[tuple[int, int]]:
+    """Map FFT bins to n_bands ERB-spaced bands. Returns list of (lo, hi) pairs."""
+    freqs   = np.fft.rfftfreq(frame_size, d=1.0 / sample_rate)
+    erb     = 21.4 * np.log10(4.37e-3 * np.maximum(freqs, 1e-3) + 1)
+    erb_min = erb[1]       # skip DC bin
+    erb_max = erb[-1]
+    edges   = np.linspace(erb_min, erb_max, n_bands + 1)
+    bands: list[tuple[int, int]] = []
+    for b in range(n_bands):
+        lo = int(np.searchsorted(erb, edges[b]))
+        hi = int(np.searchsorted(erb, edges[b + 1]))
+        hi = max(hi, lo + 1)                       # always at least 1 bin wide
+        bands.append((lo, min(hi, len(freqs))))
+    return bands
+
+
+def _residual_band_energies(
+    residual: np.ndarray,
+    frame_size: int,
+    bands: list[tuple[int, int]],
+) -> np.ndarray:
+    """
+    Compute ERB band energy envelope of the residual.
+
+    Batch-FFTs all frames at once. Returns (n_frames, n_bands) uint8,
+    globally normalised so the loudest band across the whole file = 255.
+    """
+    n_frames = len(residual) // frame_size
+    frames   = residual[:n_frames * frame_size].reshape(n_frames, frame_size).astype(np.float64)
+    win      = np.hanning(frame_size)
+    frames   = frames * win                        # broadcast over n_frames
+    specs    = np.fft.rfft(frames, axis=1)         # (n_frames, n_fft_bins)
+    mags2    = np.abs(specs) ** 2                  # energy per bin per frame
+
+    n_bands  = len(bands)
+    energies = np.zeros((n_frames, n_bands), dtype=np.float64)
+    for b, (lo, hi) in enumerate(bands):
+        energies[:, b] = mags2[:, lo:hi].sum(axis=1)
+
+    peak = energies.max()
+    if peak > 1e-12:
+        energies /= peak
+
+    return np.clip(np.round(energies * 255), 0, 255).astype(np.uint8)
+
+# ─────────────────────────────────────────────────────────────
+#  RSC7 Binary Writer
 #
-#  Header (35 bytes):
-#    "RSC6" | u8 ver | u32 sr | u32 frame_sz | u16 n_partials |
+#  Header (40 bytes):
+#    "RSC7" | u8 ver | u32 sr | u32 frame_sz | u16 n_partials |
 #    u32 total_samples | u32 total_frames | u16 mask_sz |
-#    u8 k_freq | u8 k_amp | u32 born_data_sz | u32 rice_freq_sz
+#    u8 k_freq | u8 k_amp | u32 born_data_sz | u32 rice_freq_sz |
+#    u8 n_bands | u32 residual_sz
 #
 #  Section 1 — Bitmasks  : nF * 2 * mask_sz  bytes
-#  Section 2 — Born data : born_data_sz       bytes  (uint16 fq + uint8 amu, uncompressed)
-#  Section 3 — Rice freq : rice_freq_sz       bytes  (zigzag+Rice(k_freq) freq deltas)
-#  Section 4 — Rice amp  : remaining          bytes  (zigzag+Rice(k_amp)  amp  deltas)
+#  Section 2 — Born data : born_data_sz       bytes  (uint16 fq + uint8 amu)
+#  Section 3 — Rice freq : rice_freq_sz       bytes
+#  Section 4 — Rice amp  : rice_amp_sz        bytes
+#  Section 5 — Residual  : residual_sz        bytes  (nF * n_bands uint8, row-major)
 # ─────────────────────────────────────────────────────────────
 def write_rsc(
     path: str,
-    frame_freqs: np.ndarray,
-    frame_amps:  np.ndarray,
-    sample_rate: int,
-    frame_size:  int,
+    frame_freqs:   np.ndarray,
+    frame_amps:    np.ndarray,
+    band_energies: np.ndarray,       # (n_frames, n_bands) uint8
+    sample_rate:   int,
+    frame_size:    int,
     total_samples: int,
 ) -> None:
     n_frames, n_partials = frame_freqs.shape
-    mask_sz    = (n_partials + 7) // 8
+    n_bands  = band_energies.shape[1]
+    mask_sz  = (n_partials + 7) // 8
+
     freq_scale = 65535.0 / (sample_rate / 2.0)
-
     f_q  = np.clip(np.round(frame_freqs * freq_scale), 0, 65535).astype(np.int32)
-    a_mu = _mulaw_encode(frame_amps)                                # (F, P) uint8
+    a_mu = _mulaw_encode(frame_amps)
 
-    # ── Vectorised Pass 1 ────────────────────────────────────────────────
-    #
-    # was_alive[i, slot] = alive[i-1, slot] (False for frame 0 — no prior context).
-    # Continuing slots: alive at both i-1 and i.
-    # Delta validity range matches original int16/int8 checks exactly.
-    # np.where returns indices in row-major (frame-first, ascending slot) order,
-    # so born_buf and delta list order are identical to the original Python loop.
-    #
-    alive      = frame_amps > ALIVE_THRESHOLD                           # (F, P) bool
+    alive      = frame_amps > ALIVE_THRESHOLD
     was_alive  = np.vstack([np.zeros((1, n_partials), bool), alive[:-1]])
     nat_born   = alive & ~was_alive
     continuing = alive & was_alive
 
     f_q_prev  = np.vstack([np.zeros((1, n_partials), np.int32), f_q[:-1]])
     amu_prev  = np.vstack([np.zeros((1, n_partials), np.int32), a_mu[:-1].astype(np.int32)])
-
-    df_mat = (f_q - f_q_prev).astype(np.int32)
-    da_mat = (a_mu.astype(np.int32) - amu_prev)
+    df_mat    = (f_q - f_q_prev).astype(np.int32)
+    da_mat    = (a_mu.astype(np.int32) - amu_prev)
 
     overflow = continuing & (
         (df_mat < -32768) | (df_mat > 32767) |
         (da_mat <   -128) | (da_mat >    127)
     )
-
     born_bits_mat = nat_born | overflow
     valid_cont    = continuing & ~overflow
 
-    # ── Bitmasks (vectorised, no per-frame loop) ─────────────────────────
+    # ── Bitmasks ──────────────────────────────────────────────────────
     pad_w     = mask_sz * 8
     alive_pad = np.zeros((n_frames, pad_w), np.uint8)
     born_pad  = np.zeros((n_frames, pad_w), np.uint8)
     alive_pad[:, :n_partials] = alive
     born_pad [:, :n_partials] = born_bits_mat
+    alive_packed = np.packbits(alive_pad, axis=1, bitorder="little")
+    born_packed  = np.packbits(born_pad,  axis=1, bitorder="little")
+    bitmask_buf  = np.stack([alive_packed, born_packed], axis=1).tobytes()
 
-    alive_packed = np.packbits(alive_pad, axis=1, bitorder="little")  # (F, mask_sz)
-    born_packed  = np.packbits(born_pad,  axis=1, bitorder="little")  # (F, mask_sz)
-
-    # np.stack → (F, 2, mask_sz); .tobytes() in C order yields
-    # alive[0], born[0], alive[1], born[1], ... — identical to original.
-    stacked     = np.stack([alive_packed, born_packed], axis=1)
-    bitmask_buf = stacked.tobytes()
-
-    # ── Born buffer (batch uint16-LE + uint8, no struct loop) ────────────
-    br, bc = np.where(born_bits_mat)          # ascending frame then slot
+    # ── Born buffer ───────────────────────────────────────────────────
+    br, bc = np.where(born_bits_mat)
     if len(br):
-        bfq  = f_q [br, bc].astype(np.uint16)
+        bfq  = f_q[br, bc].astype(np.uint16)
         bamu = a_mu[br, bc]
         raw  = np.empty(len(br) * 3, np.uint8)
         raw[0::3] = (bfq & 0xFF).astype(np.uint8)
-        raw[1::3] = (bfq >> 8  ).astype(np.uint8)
+        raw[1::3] = (bfq >> 8).astype(np.uint8)
         raw[2::3] = bamu
         born_buf = raw.tobytes()
     else:
         born_buf = b""
 
-    # ── Delta arrays ──────────────────────────────────────────────────────
+    # ── Delta streams ─────────────────────────────────────────────────
     cr, cc      = np.where(valid_cont)
     freq_deltas = df_mat[cr, cc].astype(np.int32) if len(cr) else np.array([], np.int32)
     amp_deltas  = da_mat[cr, cc].astype(np.int32) if len(cr) else np.array([], np.int32)
-
     print(f"   Pass 1 done  |  {len(br)} births  |  {len(cr)} continuing deltas")
 
-    # ── Pass 2: zigzag + Rice encode delta streams ────────────────────────
     fd_zz  = _zigzag(freq_deltas)
     ad_zz  = _zigzag(amp_deltas)
     k_freq = _optimal_k(fd_zz)
     k_amp  = _optimal_k(ad_zz)
     print(f"   Rice k_freq={k_freq}  k_amp={k_amp}"
           f"  |  {len(freq_deltas)} freq deltas  {len(amp_deltas)} amp deltas")
-
     rice_freq = _rice_encode(fd_zz, k_freq)
     rice_amp  = _rice_encode(ad_zz, k_amp)
 
-    # ── Write file ────────────────────────────────────────────────────────
+    # ── Residual section ──────────────────────────────────────────────
+    residual_buf = band_energies.tobytes()          # row-major: frame0[b0..bN], frame1...
+
+    # ── Header ────────────────────────────────────────────────────────
     born_data_sz = len(born_buf)
     rice_freq_sz = len(rice_freq)
+    residual_sz  = len(residual_buf)
 
     header = struct.pack(
-        "<4sBIIHIIHBBII",
-        b"RSC6", 6,
+        "<4sBIIHIIHBBIIBI",
+        b"RSC7", 7,
         sample_rate, frame_size, n_partials,
         total_samples, n_frames,
         mask_sz, k_freq, k_amp,
         born_data_sz, rice_freq_sz,
+        n_bands, residual_sz,
     )
-    assert len(header) == 35, f"Header size wrong: {len(header)}"
+    assert len(header) == 40, f"Header size wrong: {len(header)}"
 
     with open(path, "wb") as fh:
         fh.write(header)
@@ -411,16 +443,16 @@ def write_rsc(
         fh.write(born_buf)
         fh.write(rice_freq)
         fh.write(rice_amp)
+        fh.write(residual_buf)
 
-    total_sz = 35 + len(bitmask_buf) + born_data_sz + rice_freq_sz + len(rice_amp)
-    rsc4_sz  = 23 + n_frames * n_partials * 4
+    total_sz = 40 + len(bitmask_buf) + born_data_sz + rice_freq_sz + len(rice_amp) + residual_sz
     kb       = total_sz / 1024
-    saving4  = 100.0 * (1.0 - total_sz / rsc4_sz)
+    res_kb   = residual_sz / 1024
     print(f"  ✅ Wrote {n_frames} frames → {path}")
-    print(f"     {kb:.1f} KB  ({saving4:.1f}% smaller than RSC4  {kb/60:.2f} KB/s avg)")
+    print(f"     {kb:.1f} KB total  ({kb/60:.2f} KB/s avg)")
     print(f"     Bitmasks {len(bitmask_buf)/1024:.1f} KB  |  Born {born_data_sz/1024:.1f} KB"
-          f"  |  Rice-freq {rice_freq_sz/1024:.1f} KB  |  Rice-amp {len(rice_amp)/1024:.1f} KB")
-
+          f"  |  Rice-freq {rice_freq_sz/1024:.1f} KB  |  Rice-amp {len(rice_amp)/1024:.1f} KB"
+          f"  |  Residual {res_kb:.1f} KB ({n_bands} bands)")
 
 # ─────────────────────────────────────────────────────────────
 #  Main Encode Pipeline
@@ -446,7 +478,8 @@ def encode(
         g       = gcd(target_sr, native_sr)
         samples = resample_poly(samples, target_sr // g, native_sr // g).astype(np.float32)
         peak    = np.max(np.abs(samples))
-        samples /= peak
+        if peak > 1e-9:
+            samples /= peak
 
     sample_rate   = target_sr
     total_samples = len(samples)
@@ -460,41 +493,31 @@ def encode(
           f"  |  {n_frames} frames")
 
     state = AnalysisState(sample_rate)
-
     max_meaningful = int(state.nyquist / state.bin_width / state.min_dist)
     if n_partials > max_meaningful:
-        print(f"   ⚠  Clamping partials {n_partials} → {max_meaningful} "
-              f"(max find_peaks can deliver at this window size)")
+        print(f"   ⚠  Clamping partials {n_partials} → {max_meaningful}")
         n_partials = max_meaningful
-
     n_cand = n_partials
+
     print(f"   Analysis win   : {ANALYSIS_WIN} samp ({state.bin_width:.1f} Hz/bin)"
           f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN}  workers={n_workers}")
 
-    # ── Phase 1: parallel FFT candidate extraction ────────────────────────
-    # numpy's FFT releases the GIL, so threads genuinely parallelise here.
-    # _fft_candidates only reads state.pad_buf (via .copy()) — thread-safe.
+    # ── Phase 1: parallel FFT candidate extraction ────────────────────
     centers = [i * frame_size + frame_size // 2 for i in range(n_frames)]
     print(f"   Extracting FFT candidates ({n_workers} thread(s)) ...")
-
     def _extract(center: int) -> tuple[np.ndarray, np.ndarray]:
         return _fft_candidates(samples, center, state, n_cand)
-
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
         candidates = list(pool.map(_extract, centers))
 
-    # ── Phase 2: sequential greedy tracking ──────────────────────────────
-    # Tracking is inherently serial (each frame depends on the previous),
-    # but the FFT work above is already done.
+    # ── Phase 2: sequential greedy tracking ───────────────────────────
     print(f"   Tracking partials ...")
-    all_f = np.zeros((n_frames, n_partials), dtype=np.float32)
-    all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
-
+    all_f      = np.zeros((n_frames, n_partials), dtype=np.float32)
+    all_a      = np.zeros((n_frames, n_partials), dtype=np.float32)
     prev_f     = np.zeros(n_partials, np.float32)
     prev_a     = np.zeros(n_partials, np.float32)
     prevprev_f = np.zeros(n_partials, np.float32)
     cooldowns  = np.zeros(n_partials, np.int32)
-
     for i, (cf, ca) in enumerate(candidates):
         of, oa, cooldowns = _track_greedy(
             cf, ca, prev_f, prev_a, prevprev_f, n_partials, cooldowns
@@ -504,20 +527,31 @@ def encode(
         prevprev_f = prev_f
         prev_f     = of
         prev_a     = oa
-
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
             print(f"   ... tracked frame {i+1}/{n_frames}", end="\r")
     print()
 
-    write_rsc(output_path, all_f, all_a, sample_rate, frame_size, total_samples)
+    # ── Phase 3: residual computation ─────────────────────────────────
+    print(f"   Resynthesizing sines for residual ...")
+    sine_sum  = _synthesize_fast(all_f, all_a, frame_size, sample_rate)
+    sine_peak = np.max(np.abs(sine_sum))
+    if sine_peak > 1e-9:
+        sine_sum = sine_sum / sine_peak            # same scale as normalised input
+    residual  = samples[:len(sine_sum)] - sine_sum
 
+    print(f"   Computing ERB band envelope ({N_RESIDUAL_BANDS} bands) ...")
+    bands         = _erb_band_bins(frame_size, sample_rate, N_RESIDUAL_BANDS)
+    band_energies = _residual_band_energies(residual, frame_size, bands)
+
+    write_rsc(output_path, all_f, all_a, band_energies,
+              sample_rate, frame_size, total_samples)
 
 # ─────────────────────────────────────────────────────────────
 #  CLI
 # ─────────────────────────────────────────────────────────────
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="RSC6 Encoder",
+        description="RSC7 Encoder",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--input",      "-i", required=True)
@@ -531,7 +565,6 @@ def main() -> None:
     args = p.parse_args()
     out  = args.output or (args.input.removesuffix(".wav") + RSC_EXTENSION)
     encode(args.input, out, args.partials, args.samplerate, args.workers)
-
 
 if __name__ == "__main__":
     main()
