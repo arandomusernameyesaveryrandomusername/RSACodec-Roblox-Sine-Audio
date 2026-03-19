@@ -4,6 +4,7 @@
 *.ogg
 *.aac
 *.m4a
+*.opus
 # Python virtualenv
 venv/
 .venv/
