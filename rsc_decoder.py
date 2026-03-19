@@ -15,6 +15,17 @@ import wave
 import numpy as np
 
 TWO_PI    = 2.0 * math.pi
+MU        = 255.0
+_LOG1P_MU = math.log1p(MU)
+
+
+# ─────────────────────────────────────────────────────────────
+#  Mu-law expand  (inverse of encoder's _mulaw_encode)
+# ─────────────────────────────────────────────────────────────
+def _mulaw_decode(u: np.ndarray) -> np.ndarray:
+    """uint8 [0,255] → float64 [0,1]  (inverse mu-law expansion)"""
+    u_norm = u.astype(np.float64) / MU
+    return (np.exp(u_norm * _LOG1P_MU) - 1.0) / MU
 
 
 # ─────────────────────────────────────────────────────────────
@@ -88,8 +99,8 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray]:
     nyquist    = sample_rate / 2.0
     freq_scale = nyquist / 65535.0
 
-    # ── Pass 1: read all bitmasks + count born/continuing per frame ───────
-    alive_masks = []   # list of bool arrays
+    # ── Pass 1: read all bitmasks ─────────────────────────────────────────
+    alive_masks = []
     born_masks  = []
     pos = bitmask_start
     for _ in range(total_frames):
@@ -99,23 +110,17 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray]:
         born_masks.append( np.unpackbits(born_raw,  bitorder="little")[:n_partials].astype(bool))
         pos += 2 * mask_sz
 
-    # ── Pass 2: count total continuing partials for pre-allocation ────────
-    n_continuing = sum(
-        int(np.sum(alive_masks[i] & ~born_masks[i]))
-        for i in range(total_frames)
-    )
-
-    # ── Pass 3: Rice-decode freq and amp delta streams ────────────────────
+    # ── Pass 2: Rice-decode freq and amp delta streams ────────────────────
     freq_reader = _BitReader(raw, rice_freq_start)
     amp_reader  = _BitReader(raw, rice_amp_start)
 
-    # ── Pass 4: reconstruct freq/amp arrays ──────────────────────────────
-    freqs = np.zeros((total_frames, n_partials), dtype=np.float32)
-    amps  = np.zeros((total_frames, n_partials), dtype=np.float32)
+    # ── Pass 3: reconstruct freq/amp arrays ──────────────────────────────
+    freqs   = np.zeros((total_frames, n_partials), dtype=np.float32)
+    amps_mu = np.zeros((total_frames, n_partials), dtype=np.uint8)   # mu-law domain
 
     curr_fq  = np.zeros(n_partials, dtype=np.int32)
     curr_amu = np.zeros(n_partials, dtype=np.int32)
-    born_pos = born_start   # byte offset into raw for born data
+    born_pos = born_start
 
     for i in range(total_frames):
         alive = alive_masks[i]
@@ -132,16 +137,23 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray]:
                 curr_fq[slot]  = fq
                 curr_amu[slot] = amu
             else:
-                curr_fq[slot]  += freq_reader.read_rice(k_freq)
-                curr_amu[slot] += amp_reader.read_rice(k_amp)
+                # clamp after delta to prevent out-of-range values
+                curr_fq[slot]  = max(0, min(65535, curr_fq[slot]  + freq_reader.read_rice(k_freq)))
+                curr_amu[slot] = max(0, min(255,   curr_amu[slot] + amp_reader.read_rice(k_amp)))
 
-            freqs[i, slot] = curr_fq[slot]  * freq_scale
-            amps[i, slot]  = curr_amu[slot] / 255.0
+            freqs[i, slot]   = curr_fq[slot] * freq_scale
+            amps_mu[i, slot] = curr_amu[slot]
 
         if (i + 1) % 500 == 0 or (i + 1) == total_frames:
             print(f"   ... parsed frame {i+1}/{total_frames}", end="\r")
 
     print()
+
+    # FIX: apply mu-law expansion to recover linear amplitudes
+    # encoder stored: a_mu = round(255 * log1p(255*x) / log1p(255))
+    # inverse:        x    = (exp(a_mu/255 * log1p(255)) - 1) / 255
+    amps = _mulaw_decode(amps_mu).astype(np.float32)
+
     return metadata, freqs, amps
 
 
@@ -168,7 +180,11 @@ def synthesize(
             output[i * frame_size : (i + 1) * frame_size] = (
                 aa[:, None] * np.sin(TWO_PI * fa[:, None] * t + pa[:, None])
             ).sum(axis=0)
+
+        # Accumulate phase for live slots; zero dead ones so reborn slots
+        # don't inherit stale phase and click.
         phi = (phi + TWO_PI * f * frame_size / sample_rate) % TWO_PI
+        phi[~active] = 0.0
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
             print(f"   ... synthesized frame {i+1}/{n_frames}", end="\r")
