@@ -1,4 +1,6 @@
 from __future__ import annotations
+
+from rsc_decoder import _BitReader
 """
 rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder
 Format: RSC7 (RSC6 + ERB residual band envelope)
@@ -27,7 +29,7 @@ ANALYSIS_WIN         = 4096
 SLOT_COOLDOWN        = 1
 MU                   = 255.0
 ALIVE_THRESHOLD      = 0
-N_RESIDUAL_BANDS     = 128          # ERB bands for residual envelope
+N_RESIDUAL_BANDS     = 24          # ERB bands for residual envelope
 TWO_PI               = 2.0 * math.pi
 _LOG1P_MU            = math.log1p(MU)
 
@@ -93,12 +95,13 @@ def _rice_encode(vals: np.ndarray, k: int) -> bytearray:
 # ─────────────────────────────────────────────────────────────
 #  WAV Loading
 # ─────────────────────────────────────────────────────────────
-def load_audio(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
-    y, sr = librosa.load(path, sr=target_sr, mono=True)
+def load_audio(path: str) -> tuple[np.ndarray, int]:
+    """Load audio at its native sample rate, normalised to [-1, 1]."""
+    y, sr = librosa.load(path, sr=None, mono=True)
     peak = np.max(np.abs(y))
     if peak > 1e-9:
         y = y / peak
-    return y.astype(np.float32), target_sr
+    return y.astype(np.float32), sr
 
 # ─────────────────────────────────────────────────────────────
 #  Analysis State
@@ -250,7 +253,6 @@ def _track_greedy(
 
 # ─────────────────────────────────────────────────────────────
 #  Fast sine resynthesis  (for residual computation)
-#
 #  Phase logic must stay identical to the decoder's synthesize().
 # ─────────────────────────────────────────────────────────────
 def _synthesize_fast(
@@ -280,7 +282,7 @@ def _synthesize_fast(
     return output.astype(np.float32)
 
 # ─────────────────────────────────────────────────────────────
-#  ERB residual band encoding
+#  ERB band encoding  (from residual + A-weighting)
 # ─────────────────────────────────────────────────────────────
 def _erb_band_bins(
     frame_size: int,
@@ -297,39 +299,120 @@ def _erb_band_bins(
     for b in range(n_bands):
         lo = int(np.searchsorted(erb, edges[b]))
         hi = int(np.searchsorted(erb, edges[b + 1]))
-        hi = max(hi, lo + 1)                       # always at least 1 bin wide
-        bands.append((lo, min(hi, len(freqs))))
+        hi = max(hi, lo + 1)
+        # Last band must extend all the way to Nyquist —
+        # searchsorted returns len(freqs)-1 for erb_max, missing the last bin.
+        if b == n_bands - 1:
+            hi = len(freqs)
+        else:
+            hi = min(hi, len(freqs))
+        bands.append((lo, hi))
     return bands
 
 
-def _residual_band_energies(
-    residual: np.ndarray,
-    frame_size: int,
+def _a_weights_for_bands(
     bands: list[tuple[int, int]],
+    frame_size: int,
+    sample_rate: int,
 ) -> np.ndarray:
     """
-    Compute ERB band energy envelope of the residual.
+    Compute normalised A-weighting coefficient for each ERB band.
 
-    Batch-FFTs all frames at once. Returns (n_frames, n_bands) uint8,
-    globally normalised so the loudest band across the whole file = 255.
+    Uses the centre frequency of each band derived from the same rfftfreq
+    array that was used to build `bands`, so bin indices stay consistent.
+    Peak weight is normalised to 1.0.
+
+    A(f) = 12194² f⁴ / [(f²+20.6²) √((f²+107.7²)(f²+737.9²)) (f²+12194²)]
     """
-    n_frames = len(residual) // frame_size
-    frames   = residual[:n_frames * frame_size].reshape(n_frames, frame_size).astype(np.float64)
-    win      = np.hanning(frame_size)
-    frames   = frames * win                        # broadcast over n_frames
-    specs    = np.fft.rfft(frames, axis=1)         # (n_frames, n_fft_bins)
-    mags2    = np.abs(specs) ** 2                  # energy per bin per frame
+    # Use the same frequency array that _erb_band_bins used — avoids any
+    # size mismatch if frame_size produces an odd-length rfft output.
+    freqs   = np.fft.rfftfreq(frame_size, d=1.0 / sample_rate)
+    weights = np.zeros(len(bands), dtype=np.float64)
+    for b, (lo, hi) in enumerate(bands):
+        fc  = float(np.mean(freqs[lo:hi]))     # centre freq of this band in Hz
+        fc  = max(fc, 10.0)                     # guard against f≈0 on band 0
+        f2  = fc * fc
+        num = (12194.0 ** 2) * (f2 ** 2)
+        den = ((f2 + 20.6  ** 2)
+               * np.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2))
+               * (f2 + 12194.0 ** 2))
+        weights[b] = num / den if den > 0 else 0.0
+
+    peak = weights.max()
+    if peak > 1e-12:
+        weights /= peak
+    return weights.astype(np.float32)
+
+
+def _band_energies_from_audio(
+    audio: np.ndarray,
+    frame_size: int,
+    bands: list[tuple[int, int]],
+    a_weights: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute A-weighted ERB band energy envelope of the residual.
+
+    Uses a DPSS (Slepian) window — same family as the analysis window —
+    for better sidelobe rejection than Hann.
+
+    Returns (n_frames, n_bands) int16 in [0, 32767], globally normalised
+    so the loudest weighted band = 32767.
+    """
+    n_frames = len(audio) // frame_size
+    frames   = audio[:n_frames * frame_size].reshape(n_frames, frame_size).astype(np.float64)
+    win      = windows.dpss(frame_size, 4.0, sym=False).astype(np.float64)
+    frames   = frames * win[np.newaxis, :]
+    specs    = np.fft.rfft(frames, axis=1)
+    mags2    = np.abs(specs) ** 2
 
     n_bands  = len(bands)
     energies = np.zeros((n_frames, n_bands), dtype=np.float64)
     for b, (lo, hi) in enumerate(bands):
-        energies[:, b] = mags2[:, lo:hi].sum(axis=1)
+        energies[:, b] = mags2[:, lo:hi].sum(axis=1) * float(a_weights[b])
 
     peak = energies.max()
     if peak > 1e-12:
         energies /= peak
 
-    return np.clip(np.round(energies * 255), 0, 255).astype(np.uint8)
+    return np.clip(np.round(energies * 32767), 0, 32767).astype(np.int16)
+
+# ─────────────────────────────────────────────────────────────
+#  Residual band Rice encoder
+#
+#  Delta-encodes each band time-series independently (frame-to-frame),
+#  then concatenates all bands into one zigzag+Rice stream.
+#  This exploits temporal smoothness of band envelopes.
+# ─────────────────────────────────────────────────────────────
+def _encode_residual_bands(band_energies: np.ndarray) -> tuple[bytearray, int]:
+    """
+    band_energies : (n_frames, n_bands) int16 [0, 32767]
+    Returns (rice_bytes, k_residual).
+    Delta is along the frame axis per band, concatenated band-by-band.
+    """
+    n_frames, n_bands = band_energies.shape
+    vals = band_energies.astype(np.int32)           # (n_frames, n_bands)
+    # Delta along time axis: first row stored absolute, rest are diffs
+    deltas = np.empty_like(vals)
+    deltas[0, :]  = vals[0, :]                      # absolute first frame
+    deltas[1:, :] = vals[1:, :] - vals[:-1, :]      # frame-to-frame diff
+    # Concatenate band by band (each band's full time series in order)
+    flat   = deltas.T.ravel().astype(np.int32)       # (n_bands * n_frames,)
+    zz     = _zigzag(flat)
+    k      = _optimal_k(zz)
+    return _rice_encode(zz, k), k
+
+
+def _decode_residual_bands_check(rice_bytes: bytearray, k: int,
+                                  n_frames: int, n_bands: int) -> np.ndarray:
+    """Round-trip check only — not used in production encoder."""
+    from io import BytesIO
+    reader = _BitReader(bytes(rice_bytes), 0)
+    flat   = np.array([reader.read_rice(k) for _ in range(n_bands * n_frames)], dtype=np.int32)
+    deltas = flat.reshape(n_bands, n_frames)
+    vals   = np.cumsum(deltas, axis=1).T             # (n_frames, n_bands)
+    return np.clip(vals, 0, 32767).astype(np.int16)
+
 
 # ─────────────────────────────────────────────────────────────
 #  RSC7 Binary Writer
@@ -350,7 +433,7 @@ def write_rsc(
     path: str,
     frame_freqs:   np.ndarray,
     frame_amps:    np.ndarray,
-    band_energies: np.ndarray,       # (n_frames, n_bands) uint8
+    band_energies: np.ndarray,       # (n_frames, n_bands) int16
     sample_rate:   int,
     frame_size:    int,
     total_samples: int,
@@ -418,24 +501,28 @@ def write_rsc(
     rice_freq = _rice_encode(fd_zz, k_freq)
     rice_amp  = _rice_encode(ad_zz, k_amp)
 
-    # ── Residual section ──────────────────────────────────────────────
-    residual_buf = band_energies.tobytes()          # row-major: frame0[b0..bN], frame1...
+    # ── Residual section: delta + zigzag + Rice ──────────────────────
+    residual_buf, k_residual = _encode_residual_bands(band_energies)
 
-    # ── Header ────────────────────────────────────────────────────────
+    # ── Header (41 bytes) ─────────────────────────────────────────────
+    #   "RSC7" | u8 ver | u32 sr | u32 frame_sz | u16 n_partials |
+    #   u32 total_samples | u32 total_frames | u16 mask_sz |
+    #   u8 k_freq | u8 k_amp | u32 born_data_sz | u32 rice_freq_sz |
+    #   u8 n_bands | u8 k_residual | u32 residual_sz
     born_data_sz = len(born_buf)
     rice_freq_sz = len(rice_freq)
     residual_sz  = len(residual_buf)
 
     header = struct.pack(
-        "<4sBIIHIIHBBIIBI",
+        "<4sBIIHIIHBBIIBBI",
         b"RSC7", 7,
         sample_rate, frame_size, n_partials,
         total_samples, n_frames,
         mask_sz, k_freq, k_amp,
         born_data_sz, rice_freq_sz,
-        n_bands, residual_sz,
+        n_bands, k_residual, residual_sz,
     )
-    assert len(header) == 40, f"Header size wrong: {len(header)}"
+    assert len(header) == 41, f"Header size wrong: {len(header)}"
 
     with open(path, "wb") as fh:
         fh.write(header)
@@ -445,14 +532,14 @@ def write_rsc(
         fh.write(rice_amp)
         fh.write(residual_buf)
 
-    total_sz = 40 + len(bitmask_buf) + born_data_sz + rice_freq_sz + len(rice_amp) + residual_sz
+    total_sz = 41 + len(bitmask_buf) + born_data_sz + rice_freq_sz + len(rice_amp) + residual_sz
     kb       = total_sz / 1024
     res_kb   = residual_sz / 1024
     print(f"  ✅ Wrote {n_frames} frames → {path}")
     print(f"     {kb:.1f} KB total  ({kb/60:.2f} KB/s avg)")
     print(f"     Bitmasks {len(bitmask_buf)/1024:.1f} KB  |  Born {born_data_sz/1024:.1f} KB"
           f"  |  Rice-freq {rice_freq_sz/1024:.1f} KB  |  Rice-amp {len(rice_amp)/1024:.1f} KB"
-          f"  |  Residual {res_kb:.1f} KB ({n_bands} bands)")
+          f"  |  Residual {res_kb:.1f} KB ({n_bands} bands, k={k_residual})")
 
 # ─────────────────────────────────────────────────────────────
 #  Main Encode Pipeline
@@ -467,7 +554,7 @@ def encode(
     print(f"RSC Encoder  --  {input_path}")
     print(f"   Partials/frame : {n_partials}  |  Target SR: {target_sr} Hz")
 
-    samples, native_sr = load_audio(input_path, target_sr)
+    samples, native_sr = load_audio(input_path)
     print(f"   Native SR      : {native_sr} Hz  |  {len(samples)} samples  "
           f"({len(samples)/native_sr:.2f}s)")
 
@@ -477,7 +564,8 @@ def encode(
         from scipy.signal import resample_poly
         g       = gcd(target_sr, native_sr)
         samples = resample_poly(samples, target_sr // g, native_sr // g).astype(np.float32)
-        peak    = np.max(np.abs(samples))
+        # Re-normalise after resample — poly resampling can push peaks slightly above 1.0
+        peak = np.max(np.abs(samples))
         if peak > 1e-9:
             samples /= peak
 
@@ -531,17 +619,21 @@ def encode(
             print(f"   ... tracked frame {i+1}/{n_frames}", end="\r")
     print()
 
-    # ── Phase 3: residual computation ─────────────────────────────────
-    print(f"   Resynthesizing sines for residual ...")
+    # ── Phase 3: residual = original − sines, encode band envelope ───────
+    print(f"   Resynthesizing sines ...")
     sine_sum  = _synthesize_fast(all_f, all_a, frame_size, sample_rate)
+    # Match scales before subtracting — sine_sum is normalised to its own peak,
+    # samples is normalised to [-1, 1]. Align sine peak to sample peak so the
+    # subtraction actually cancels the tonal content.
     sine_peak = np.max(np.abs(sine_sum))
     if sine_peak > 1e-9:
-        sine_sum = sine_sum / sine_peak            # same scale as normalised input
+        sine_sum *= (np.max(np.abs(samples[:len(sine_sum)])) / sine_peak)
     residual  = samples[:len(sine_sum)] - sine_sum
 
-    print(f"   Computing ERB band envelope ({N_RESIDUAL_BANDS} bands) ...")
+    print(f"   Computing A-weighted ERB residual envelope ({N_RESIDUAL_BANDS} bands) ...")
     bands         = _erb_band_bins(frame_size, sample_rate, N_RESIDUAL_BANDS)
-    band_energies = _residual_band_energies(residual, frame_size, bands)
+    a_weights     = _a_weights_for_bands(bands, frame_size, sample_rate)
+    band_energies = _band_energies_from_audio(residual, frame_size, bands, a_weights)
 
     write_rsc(output_path, all_f, all_a, band_energies,
               sample_rate, frame_size, total_samples)

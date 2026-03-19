@@ -15,6 +15,7 @@ import struct
 import wave
 
 import numpy as np
+from scipy.signal import windows
 
 TWO_PI    = 2.0 * math.pi
 MU        = 255.0
@@ -70,6 +71,7 @@ def _erb_band_bins(
     sample_rate: int,
     n_bands: int,
 ) -> list[tuple[int, int]]:
+    """Must stay byte-for-byte identical to the encoder's _erb_band_bins."""
     freqs   = np.fft.rfftfreq(frame_size, d=1.0 / sample_rate)
     erb     = 21.4 * np.log10(4.37e-3 * np.maximum(freqs, 1e-3) + 1)
     erb_min = erb[1]
@@ -80,7 +82,12 @@ def _erb_band_bins(
         lo = int(np.searchsorted(erb, edges[b]))
         hi = int(np.searchsorted(erb, edges[b + 1]))
         hi = max(hi, lo + 1)
-        bands.append((lo, min(hi, len(freqs))))
+        # Last band must reach Nyquist — searchsorted returns len-1 for erb_max
+        if b == n_bands - 1:
+            hi = len(freqs)
+        else:
+            hi = min(hi, len(freqs))
+        bands.append((lo, hi))
     return bands
 
 # ─────────────────────────────────────────────────────────────
@@ -99,22 +106,23 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray | Non
 
     magic = raw[:4]
     if magic == b"RSC7":
-        if len(raw) < 40:
+        if len(raw) < 41:
             raise ValueError("File too short to be RSC7.")
         (_, version, sample_rate, frame_size, n_partials,
          total_samples, total_frames, mask_sz, k_freq, k_amp,
          born_data_sz, rice_freq_sz,
-         n_bands, residual_sz) = struct.unpack_from("<4sBIIHIIHBBIIBI", raw, 0)
-        header_sz = 40
+         n_bands, k_residual, residual_sz) = struct.unpack_from("<4sBIIHIIHBBIIBBI", raw, 0)
+        header_sz = 41
         is_rsc7   = True
     elif magic == b"RSC6":
         (_, version, sample_rate, frame_size, n_partials,
          total_samples, total_frames, mask_sz, k_freq, k_amp,
          born_data_sz, rice_freq_sz) = struct.unpack_from("<4sBIIHIIHBBII", raw, 0)
-        header_sz = 35
-        n_bands   = 0
+        header_sz  = 35
+        n_bands    = 0
+        k_residual = 0
         residual_sz = 0
-        is_rsc7   = False
+        is_rsc7    = False
     else:
         raise ValueError(f"Unknown magic: {magic!r}  (expected RSC6 or RSC7)")
 
@@ -132,11 +140,8 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray | Non
     born_start      = bitmask_start + bitmask_sz
     rice_freq_start = born_start    + born_data_sz
     rice_amp_start  = rice_freq_start + rice_freq_sz
-    residual_start  = rice_amp_start  + (len(raw) - rice_amp_start - residual_sz) \
-                      if is_rsc7 else None
-    # simpler: residual is always the last residual_sz bytes
-    if is_rsc7:
-        residual_start = len(raw) - residual_sz
+    # Residual section is always the last residual_sz bytes of the file
+    residual_start = (len(raw) - residual_sz) if is_rsc7 else None
 
     nyquist    = sample_rate / 2.0
     freq_scale = nyquist / 65535.0
@@ -192,12 +197,17 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray | Non
 
     # ── Pass 4: residual band envelope (RSC7 only) ────────────────────
     band_energies: np.ndarray | None = None
-    if is_rsc7 and residual_sz > 0:
-        raw_bands = np.frombuffer(raw, dtype=np.uint8,
-                                  count=total_frames * n_bands,
-                                  offset=residual_start)
-        # reshape and normalise back to [0, 1]
-        band_energies = (raw_bands.reshape(total_frames, n_bands).astype(np.float32) / 255.0)
+    if is_rsc7 and residual_sz > 0 and residual_start is not None:
+        # Rice decode the flat delta stream (n_bands * total_frames values)
+        n_res   = n_bands * total_frames
+        reader  = _BitReader(raw, residual_start)
+        flat    = np.array([reader.read_rice(k_residual) for _ in range(n_res)], dtype=np.int32)
+        # Reconstruct: flat is stored band-by-band, cumsum along time axis
+        deltas  = flat.reshape(n_bands, total_frames)   # (n_bands, n_frames)
+        vals    = np.cumsum(deltas, axis=1).T           # (n_frames, n_bands)
+        vals    = np.clip(vals, 0, 32767).astype(np.int16)
+        # Normalise int16 [0,32767] → float32 [0,1]
+        band_energies = (vals.astype(np.float32) / 32767.0)
 
     return metadata, freqs, amps, band_energies
 
@@ -212,49 +222,65 @@ def _synthesize_noise(
     mix: float,
 ) -> np.ndarray:
     """
-    Generate shaped white noise from the residual band envelope and
-    return a float32 array the same length as the sine output.
+    Generate shaped noise with 50% overlap-add so there are no hard
+    discontinuities at frame boundaries.
 
-    Each frame: white noise → rfft → scale each ERB band by its stored
-    energy → irfft → overlap-add with a Hann window for smooth frames.
+    Each hop is frame_size//2 samples. Two consecutive Hann windows of
+    length frame_size at 50% overlap sum to a constant — perfect
+    reconstruction, no amplitude pumping.
     """
-    n_frames   = band_energies.shape[0]
-    n_fft_bins = frame_size // 2 + 1
-    out_len    = n_frames * frame_size
-    output     = np.zeros(out_len, dtype=np.float64)
-    win        = np.hanning(frame_size)
+    n_frames = band_energies.shape[0]
+    n_bands  = band_energies.shape[1]
+    bands    = bands[:n_bands]
 
-    rng = np.random.default_rng(seed=0)   # deterministic seed — same noise every decode
+    hop      = frame_size // 2
+    out_len  = n_frames * frame_size          # same total length as sine output
+    output   = np.zeros(out_len + frame_size, dtype=np.float64)  # extra for last overlap
+    # DPSS window: same family as the encoder analysis window, better sidelobe
+    # rejection than Hann. At 50% overlap DPSS with NW=4 sums close to constant.
+    win      = windows.dpss(frame_size, 4.0, sym=False)
 
+    rng = np.random.default_rng(seed=0)
+
+    # Each RSC frame drives two OLA hops so the noise tempo follows the
+    # codec frame rate exactly.
     for i in range(n_frames):
-        noise      = rng.standard_normal(frame_size) * win
-        noise_spec = np.fft.rfft(noise)
+        for hop_idx in range(2):
+            noise      = rng.standard_normal(frame_size) * win
+            noise_spec = np.fft.rfft(noise)
 
-        for b, (lo, hi) in enumerate(bands):
-            noise_spec[lo:hi] *= band_energies[i, b]
+            for b, (lo, hi) in enumerate(bands):
+                noise_spec[lo:hi] *= band_energies[i, b]
 
-        frame = np.fft.irfft(noise_spec, n=frame_size)
-        output[i * frame_size : (i + 1) * frame_size] += frame
+            frame   = np.fft.irfft(noise_spec, n=frame_size)
+            pos     = i * frame_size + hop_idx * hop
+            output[pos : pos + frame_size] += frame
 
         if (i + 1) % 500 == 0 or (i + 1) == n_frames:
             print(f"   ... noise frame {i+1}/{n_frames}", end="\r")
     print()
 
-    # normalise noise independently before mixing so mix ratio is meaningful
-    peak = np.max(np.abs(output))
+    output = output[:out_len]
+    peak   = np.max(np.abs(output))
     if peak > 1e-9:
         output /= peak
 
     return (output * mix).astype(np.float32)
 
 # ─────────────────────────────────────────────────────────────
-#  Phase-Continuous Sine Synthesis
+#  Phase-accumulating synthesis
+#
+#  phi[] carries the running phase for each partial across frames.
+#  Each frame renders sin(2π·f·t + phi) then advances phi by
+#  2π·f·frame_size/sr so the next frame picks up exactly where
+#  this one left off — no phase jump at frame boundaries.
+#  Dead slots get phi reset to 0 so rebirths start clean.
 # ─────────────────────────────────────────────────────────────
 def synthesize(
-    freqs:        np.ndarray,
-    amps:         np.ndarray,
-    frame_size:   int,
-    sample_rate:  int,
+    freqs:         np.ndarray,
+    amps:          np.ndarray,
+    frame_size:    int,
+    sample_rate:   int,
     band_energies: np.ndarray | None = None,
     residual_mix:  float = 0.35,
 ) -> np.ndarray:
@@ -272,6 +298,9 @@ def synthesize(
             output[i * frame_size : (i + 1) * frame_size] = (
                 aa[:, None] * np.sin(TWO_PI * fa[:, None] * t + pa[:, None])
             ).sum(axis=0)
+
+        # Accumulate phase for all slots (active or not doesn't matter —
+        # dead slots get reset to 0 below, so stale accumulation is harmless)
         phi = (phi + TWO_PI * f * frame_size / sample_rate) % TWO_PI
         phi[~active] = 0.0
 
