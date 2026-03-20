@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder
 Usage:
