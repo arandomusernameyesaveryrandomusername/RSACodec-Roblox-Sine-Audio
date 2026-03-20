@@ -20,6 +20,6 @@ If you want to try to make a Roblox decoder, go ahead.
 
 Roblox Decoder is FINISHED and Open-Source :D
 
-https://www.roblox.com/games/129402696029815/RSC-Dec
+[Download It here](https://github.com/arandomusernameyesaveryrandomusername/RSACodec-Roblox-Sine-Audio/raw/refs/heads/main/RSCv6.rbxl)
 
 Python Decoder IS finished and released
