@@ -15,8 +15,8 @@ This uses Addditve synthesis and is WIP
 I am bad at github so expect this repo to be crappy
 
 DONT SUE ME ROBLOX
-THIS REPO CAN ONLY BE EDITED BY ME, AND ME ONLY. I have no obligation against bad people and roblox decoder will not be open source.
-If you want to try to make a Roblox decoder, go ahead.
+THIS REPO CAN ONLY BE EDITED BY ME, AND ME ONLY. I have no obligation against bad people and roblox decoder is open-source which is not what I intended. But you guys forced me cause I cant update the Closed-Source Variant so fuck you
+
 
 Roblox Decoder is FINISHED and Open-Source :D
 
