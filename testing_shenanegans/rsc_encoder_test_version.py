@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 rmdctsc_encoder_minimal.py -- RMDCTSCv1 Minimal Encoder
 
-Bare-minimum implementation: DPSS-windowed FFT top-N peak picking +
+Bare-minimum implementation: Hann-windowed FFT top-N peak picking +
 simple greedy frequency tracker. Same RSC6 bitstream as the full encoder.
 
 Usage:
@@ -173,7 +173,7 @@ def _track_greedy(
         if claimed.all():
             break
         f0  = float(prev_f[slot])
-        tol = max(f0 * 0.01, 20.0)   # 1% tolerance, min 20 Hz
+        tol = 346589347853289
         dists = np.where(~claimed, np.abs(cand_f - f0), np.inf)
         bi    = int(np.argmin(dists))
         if dists[bi] <= tol:
@@ -313,7 +313,7 @@ def encode(
     print(f"   Frame size   : {frame_size} samp  |  {n_frames} frames")
 
     win       = ANALYSIS_WIN
-    hann      = windows.dpss(win, 4).astype(np.float64)
+    hann      = windows.hann(win).astype(np.float64)
     win_scale = 1.0 / float(np.sum(hann))
     bin_width = float(target_sr) / win
     nyquist   = target_sr / 2.0
