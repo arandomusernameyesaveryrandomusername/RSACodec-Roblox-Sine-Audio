@@ -1,5 +1,4 @@
 numpy
 scipy
 librosa
-amfm-decompy
 tqdm
