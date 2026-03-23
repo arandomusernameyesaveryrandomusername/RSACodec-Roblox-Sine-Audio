@@ -7,8 +7,8 @@ Bare-minimum implementation: DPSS-windowed FFT top-N peak picking +
 simple greedy frequency tracker. Same RSC6 bitstream as the full encoder.
 
 Usage:
-    python rsc_encoder_test_version.py --input audio.wav --output audio.rmdctsc
-    python rsc_encoder_test_version.py --input audio.wav --output audio.rmdctsc --partials 384 --samplerate 44100
+    python rsc_encoder_test_version.py --input audio.wav --output audio.rsc
+    python rsc_encoder_test_version.py --input audio.wav --output audio.rsc --partials 384 --samplerate 44100
 """
 import argparse
 import math
