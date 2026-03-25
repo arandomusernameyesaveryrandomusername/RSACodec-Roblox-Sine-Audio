@@ -12,6 +12,7 @@ import os
 import struct
 import librosa
 from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 import numpy as np
 from scipy.signal import find_peaks, windows
 
@@ -22,7 +23,7 @@ TARGET_FPS         = 60
 DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
-ANALYSIS_WIN       = 4096
+ANALYSIS_WIN       = 2048
 SLOT_COOLDOWN      = 1
 MU                 = 255.0
 ALIVE_THRESHOLD    = 0
@@ -102,10 +103,10 @@ def load_audio(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
 #  Analysis State
 # ─────────────────────────────────────────────────────────────
 class AnalysisState:
-    def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN, NW: float = 4.0):
+    def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = windows.dpss(analysis_win, NW, sym=False).astype(np.float32)
+        self.window    = windows.hann(analysis_win).astype(np.float32)
         self.win_scale = 1.0 / float(np.sum(self.window))
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
@@ -365,7 +366,7 @@ def write_rsc(
     kb       = total_sz / 1024
     saving4  = 100.0 * (1.0 - total_sz / rsc4_sz)
     print(f"  ✅ Wrote {n_frames} frames → {path}")
-    print(f"     {kb:.1f} KB  ({saving4:.1f}% smaller than RSC4  {kb/60:.2f} KB/s avg)")
+    print(f"     {kb:.1f} KB  ({saving4:.1f}% smaller than RSC4  {kb/(n_frames / TARGET_FPS):.2f} KB/s avg)")
     print(f"     Bitmasks {len(bitmask_buf)/1024:.1f} KB  |  Born {born_data_sz/1024:.1f} KB"
           f"  |  Rice-freq {rice_freq_sz/1024:.1f} KB  |  Rice-amp {len(rice_amp)/1024:.1f} KB")
 
@@ -421,7 +422,8 @@ def encode(
         return _fft_candidates(samples, center, state, n_cand)
 
     with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        candidates = list(pool.map(_extract, centers))
+        # wrap centers in tqdm for progress
+        candidates = list(pool.map(_extract, tqdm(centers, desc="FFT extraction")))
 
     # ── Phase 2: sequential greedy tracking ──────────────────────────────
     # Tracking is inherently serial (each frame depends on the previous),
@@ -433,7 +435,7 @@ def encode(
     prev_a     = np.zeros(n_partials, np.float32)
     prevprev_f = np.zeros(n_partials, np.float32)
     cooldowns  = np.zeros(n_partials, np.int32)
-    for i, (cf, ca) in enumerate(candidates):
+    for i, (cf, ca) in enumerate(tqdm(candidates, desc="Tracking partials")):
         of, oa, cooldowns = _track_greedy(
             cf, ca, prev_f, prev_a, prevprev_f, n_partials, cooldowns
         )
@@ -442,8 +444,6 @@ def encode(
         prevprev_f = prev_f
         prev_f     = of
         prev_a     = oa
-        if (i + 1) % 500 == 0 or (i + 1) == n_frames:
-            print(f"   ... tracked frame {i+1}/{n_frames}", end="\r")
     print()
     write_rsc(output_path, all_f, all_a, sample_rate, frame_size, total_samples)
 

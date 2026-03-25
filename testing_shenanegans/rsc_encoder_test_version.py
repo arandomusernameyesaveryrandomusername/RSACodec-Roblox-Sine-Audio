@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-rmdctsc_encoder_minimal.py -- RMDCTSCv1 Minimal Encoder  (Full-Partials edition)
+rmdctsc_encoder_minimal.py -- RMDCTSCv1 Minimal Encoder  (ATH edition)
 
 Bare-minimum implementation: Hann-windowed FFT top-N peak picking +
 simple greedy frequency tracker + ATH (Absolute Threshold of Hearing)
@@ -69,13 +69,13 @@ def _ath_linear(n_bins: int, sample_rate: int, win: int,
     Pre-compute a per-FFT-bin ATH amplitude threshold (linear, 0-1 scale).
 
     The encoder normalises audio to peak=1, which we treat as 0 dB FS.
-    We map dB SPL → dB FS with the rough assumption that 0 dB FS ≈ 96 dB SPL
+    We map dB SPL -> dB FS with the rough assumption that 0 dB FS = 96 dB SPL
     (standard for 16-bit audio), then convert to linear amplitude:
 
         amp_threshold = 10 ** ((ath_db_spl - 96 + ath_gain_db) / 20)
 
-    ath_gain_db > 0  → more aggressive (raise threshold, drop more partials)
-    ath_gain_db < 0  → more permissive (lower threshold, keep more partials)
+    ath_gain_db > 0  -> more aggressive (raise threshold, drop more partials)
+    ath_gain_db < 0  -> more permissive (lower threshold, keep more partials)
     """
     bin_freqs = np.arange(n_bins, dtype=np.float64) * sample_rate / win
     ath_spl   = _ath_db(np.maximum(bin_freqs, 20.0))
@@ -88,7 +88,7 @@ def _ath_linear(n_bins: int, sample_rate: int, win: int,
 #  Mu-law
 # ─────────────────────────────────────────────────────────────
 def _mulaw_encode(x: np.ndarray) -> np.ndarray:
-    """float32 [0,1] → uint8 [0,255]"""
+    """float32 [0,1] -> uint8 [0,255]"""
     x = np.clip(x.astype(np.float64), 0.0, 1.0)
     return np.clip(np.round(MU * np.log1p(MU * x) / _LOG1P_MU), 0, 255).astype(np.uint8)
 
@@ -146,12 +146,16 @@ def load_audio(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
     return y.astype(np.float32), target_sr
 
 # ─────────────────────────────────────────────────────────────
-#  FFT candidate extraction  (Hann window, top-N by SNR score)
-#  Candidates are ranked by perceptual salience:
-#      snr_ratio = amp / ATH_threshold   (how far above hearing floor)
-#      score     = amp * log10(snr_ratio + 1)
-#  This prioritises partials that are both loud AND well above the
-#  hearing threshold over partials that are merely loud.
+#  FFT candidate extraction  (Hann window, SNR-weighted sort)
+#
+#  Sorting uses: score = amps * log10(snr_ratio + 1)
+#  where snr_ratio = amp / ATH threshold at that frequency bin.
+#  This promotes loud partials that are well above the hearing
+#  threshold, and demotes ones that are loud in absolute terms
+#  but barely above the noise floor.
+#
+#  Swap in `snr_ratio ** 1.5` for a more aggressive variant that
+#  punishes near-threshold partials harder.
 # ─────────────────────────────────────────────────────────────
 def _fft_candidates(
     audio: np.ndarray,
@@ -177,13 +181,13 @@ def _fft_candidates(
     spec  = np.fft.rfft(chunk.astype(np.float64) * hann)
     mags  = (np.abs(spec) * win_scale).astype(np.float32)
 
-    # ── ATH gate disabled: keep all bins so we can fill all partial slots ──
+    # ── ATH gate: zero out bins below the hearing threshold ──────────
     n_bins   = len(mags)
     ath_bins = ath_lin[:n_bins]
-    # mags = np.where(mags >= ath_bins, mags, 0.0)  # disabled for full slot usage
-    # ───────────────────────────────────────────────────────────────────────
+    mags     = np.where(mags >= ath_bins, mags, 0.0)
+    # ─────────────────────────────────────────────────────────────────
 
-    peak_idx, _ = find_peaks(mags, distance=min_dist, height=1e-9)  # lowered for full slot fill
+    peak_idx, _ = find_peaks(mags, distance=min_dist, height=1e-6)
     if len(peak_idx) == 0:
         return np.array([], np.float32), np.array([], np.float32)
 
@@ -204,34 +208,15 @@ def _fft_candidates(
     in_band = (freqs >= 20.0) & (freqs <= nyquist - bin_width)
     freqs = freqs[in_band].astype(np.float32)
     amps  = np.clip(amps[in_band], 0.0, 1.0).astype(np.float32)
-    peak_bins = peak_idx[in_band]
 
-    # ── Top-up: if fewer candidates than slots, pad with highest-amplitude
-    #    non-peak bins so the tracker always has enough to fill all slots ──
-    MIN_CANDIDATES = int(nyquist / bin_width)  # use all in-band bins if needed
-    if len(freqs) < MIN_CANDIDATES:
-        peak_bin_set = set(peak_bins.tolist())
-        all_bins     = np.arange(1, len(mags) - 1)  # skip DC and Nyquist
-        extra_mask   = np.array([b not in peak_bin_set for b in all_bins])
-        extra_bins   = all_bins[extra_mask]
-        extra_freqs  = extra_bins * bin_width
-        in_band_mask = (extra_freqs >= 20.0) & (extra_freqs <= nyquist - bin_width)
-        extra_bins   = extra_bins[in_band_mask]
-        extra_freqs  = extra_freqs[in_band_mask].astype(np.float32)
-        extra_amps   = np.clip(mags[extra_bins], 0.0, 1.0)
-        # sort extra by amplitude descending, take only as many as needed
-        n_need  = MIN_CANDIDATES - len(freqs)
-        top_idx = np.argsort(extra_amps)[::-1][:n_need]
-        freqs   = np.concatenate([freqs, extra_freqs[top_idx]])
-        amps    = np.concatenate([amps,  extra_amps[top_idx]])
-        peak_bins = np.concatenate([peak_bins, extra_bins[top_idx]])
-    # ─────────────────────────────────────────────────────────────────
-
-    # ── SNR-based perceptual sort ─────────────────────────────────────
-    ath_at_peaks = ath_bins[np.clip(peak_bins, 0, len(ath_bins) - 1)].astype(np.float32)
-    snr_ratio    = amps / np.maximum(ath_at_peaks, 1e-12)
-    score        = amps * np.log10(snr_ratio + 1.0)
-    order        = np.argsort(score)[::-1]
+    # ── SNR-weighted sort ────────────────────────────────────────────
+    peak_bin_indices = peak_idx[in_band]
+    ath_at_peaks     = ath_bins[np.clip(peak_bin_indices, 0, len(ath_bins) - 1)]
+    noise_floor      = np.maximum(ath_at_peaks, 1e-9)   # avoid div-by-zero
+    snr_ratio        = amps / noise_floor
+    score            = amps * np.log10(snr_ratio + 1.0)
+    # score          = amps * snr_ratio ** 1.5            # aggressive alternative
+    order            = np.argsort(score)[::-1]
     return freqs[order], amps[order]
     # ─────────────────────────────────────────────────────────────────
 
@@ -261,7 +246,7 @@ def _track_greedy(
         if claimed.all():
             break
         f0  = float(prev_f[slot])
-        tol = 652938475983
+        tol = 346589347853289
         dists = np.where(~claimed, np.abs(cand_f - f0), np.inf)
         bi    = int(np.argmin(dists))
         if dists[bi] <= tol:
@@ -372,20 +357,10 @@ def write_rsc(
     rsc4_sz  = 23 + n_frames * n_partials * 4
     kb       = total_sz / 1024
     saving4  = 100.0 * (1.0 - total_sz / rsc4_sz)
-
-    # Active-partial statistics (partials that survived the ATH gate each frame)
-    active_per_frame = alive.sum(axis=1)          # shape: (n_frames,)
-    avg_active = float(active_per_frame.mean())
-    min_active = int(active_per_frame.min())
-    max_active = int(active_per_frame.max())
-    utilisation = 100.0 * avg_active / n_partials
-
-    print(f"  ✅ Wrote {n_frames} frames → {path}")
+    print(f"  ✅ Wrote {n_frames} frames -> {path}")
     print(f"     {kb:.1f} KB  ({saving4:.1f}% smaller than RSC4  {kb/60:.2f} KB/s avg)")
     print(f"     Bitmasks {len(bitmask_buf)/1024:.1f} KB  |  Born {born_data_sz/1024:.1f} KB"
           f"  |  Rice-freq {rice_freq_sz/1024:.1f} KB  |  Rice-amp {len(rice_amp)/1024:.1f} KB")
-    print(f"     Active partials/frame  avg {avg_active:.1f}  min {min_active}  max {max_active}"
-          f"  ({utilisation:.1f}% of {n_partials} slots used)")
 
 # ─────────────────────────────────────────────────────────────
 #  Main encode pipeline
@@ -417,7 +392,7 @@ def encode(
     win_scale = 1.0 / float(np.sum(hann))
     bin_width = float(target_sr) / win
     nyquist   = target_sr / 2.0
-    min_dist  = max(1, int(round(10.0 / bin_width)))  # tighter spacing → more candidates for full slot fill
+    min_dist  = max(2, int(round(25.0 / bin_width)))
 
     # ── Pre-compute ATH threshold array (once, outside the frame loop) ──
     n_bins  = win // 2 + 1
@@ -455,29 +430,6 @@ def encode(
         prev_f   = of
         prev_a   = oa
 
-    # ── Post-tracking ATH gate ────────────────────────────────────────────
-    # Slots are already fully packed by the tracker. Now silence any partial
-    # whose amplitude is below the ATH floor at its frequency, so the
-    # bitstream doesn't waste bits on inaudible content — without starving
-    # the tracker of candidates in the first place.
-    freq_scale_inv = (target_sr / 2.0) / 65535.0          # quantised → Hz
-    for fi in range(n_frames):
-        freqs_row = all_f[fi]                              # (n_partials,)
-        amps_row  = all_a[fi]
-        active    = amps_row > 0
-        if not active.any():
-            continue
-        # map each partial's frequency to its nearest FFT bin
-        bins = np.clip(
-            np.round(freqs_row[active] / bin_width).astype(np.int32),
-            0, len(ath_lin) - 1,
-        )
-        ath_at_partial = ath_lin[bins]                     # ATH amplitude at each partial's freq
-        below_ath      = amps_row[active] < ath_at_partial
-        idx            = np.where(active)[0][below_ath]
-        all_a[fi, idx] = 0.0                               # silence — slot stays assigned
-    # ─────────────────────────────────────────────────────────────────────
-
     write_rsc(output_path, all_f, all_a, target_sr, frame_size, total_samples)
 
 # ─────────────────────────────────────────────────────────────
@@ -497,7 +449,7 @@ def main() -> None:
         "--ath-gain", "-g", type=float, default=0.0, metavar="DB",
         help=(
             "Shift the ATH curve up (+) or down (-) in dB. "
-            "+6 dB drops ~2× more partials and saves more bits; "
+            "+6 dB drops ~2x more partials and saves more bits; "
             "-6 dB is more conservative. Default: 0 (pure ISO threshold)."
         ),
     )
