@@ -15,12 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import numpy as np
 from scipy.signal import find_peaks, windows
+from numba import njit
 
 # ─────────────────────────────────────────────────────────────
 #  Constants
 # ─────────────────────────────────────────────────────────────
 TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 384
+DEFAULT_PARTIALS   = 647768
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 2048
@@ -28,6 +29,49 @@ SLOT_COOLDOWN      = 1
 MU                 = 255.0
 ALIVE_THRESHOLD    = 0
 _LOG1P_MU          = math.log1p(MU)
+
+def _ath_db(freq: np.ndarray) -> np.ndarray:
+    """
+    Terhardt (1979) approximation of the ISO quiet-listening threshold.
+    Returns dB SPL at each frequency (Hz). Values are in the range
+    ~0 dB (1–4 kHz) up to ~80 dB near DC and the Nyquist edge.
+
+    Formula:
+        ATH(f) =  3.64*(f/1000)**-0.8
+                - 6.5 * exp(-0.6*(f/1000 - 3.3)**2)
+                + 10**-3 * (f/1000)**4
+    Clipped to [-10, 90] dB for numerical safety.
+    """
+    f   = np.asarray(freq, dtype=np.float64)
+    f   = np.maximum(f, 20.0)          # avoid log/power issues near DC
+    fk  = f / 1000.0
+    ath = (
+          3.64  * fk ** -0.8
+        - 6.5   * np.exp(-0.6 * (fk - 3.3) ** 2)
+        + 1e-3  * fk ** 4
+    )
+    return np.clip(ath, -90.0, 90.0)
+
+
+def _ath_linear(n_bins: int, sample_rate: int, win: int,
+                ath_gain_db: float = 0.0) -> np.ndarray:
+    """
+    Pre-compute a per-FFT-bin ATH amplitude threshold (linear, 0-1 scale).
+
+    The encoder normalises audio to peak=1, which we treat as 0 dB FS.
+    We map dB SPL -> dB FS with the rough assumption that 0 dB FS = 96 dB SPL
+    (standard for 16-bit audio), then convert to linear amplitude:
+
+        amp_threshold = 10 ** ((ath_db_spl - 96 + ath_gain_db) / 20)
+
+    ath_gain_db > 0  -> more aggressive (raise threshold, drop more partials)
+    ath_gain_db < 0  -> more permissive (lower threshold, keep more partials)
+    """
+    bin_freqs = np.arange(n_bins, dtype=np.float64) * sample_rate / win
+    ath_spl   = _ath_db(np.maximum(bin_freqs, 20.0))
+    ath_dbfs  = ath_spl - 96.0 + ath_gain_db
+    ath_lin   = 10.0 ** (ath_dbfs / 20.0)
+    return ath_lin.astype(np.float32)
 
 # ─────────────────────────────────────────────────────────────
 #  Mu-law
@@ -110,10 +154,11 @@ class AnalysisState:
         self.win_scale = 1.0 / float(np.sum(self.window))
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
-        self.min_dist  = max(2, int(round(25.0 / self.bin_width)))
+        self.min_dist  = 1
         self.nyquist   = sample_rate / 2.0
         self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
         self.erb       = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
+        self.ath_lin    = _ath_linear(len(self.freqs), self.sr, self.win)  # shape = FFT bins
 
 # ─────────────────────────────────────────────────────────────
 #  Parabolic Peak Interpolation (module-level — no closure overhead)
@@ -162,24 +207,28 @@ def _fft_candidates(
         chunk = audio[s:e]
     spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
+    snr_ratio = mags / np.maximum(state.ath_lin, 1e-12)  # avoid divide by zero
+    snr_score = np.log1p(snr_ratio)                # smooth SNR scaling
     hfc   = mags**2 * state.erb
+    combined_score = hfc * snr_score              # HFC weighted by SNR audibility
     peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)
     if len(peak_idx) == 0:
-        peak_idx = np.argpartition(hfc, -n_candidates)[-n_candidates:]
-    peak_hfc      = hfc[peak_idx]
-    sort_order    = np.argsort(peak_hfc)[::-1]
-    sorted_idx    = peak_idx[sort_order]
+        peak_idx = np.argpartition(combined_score, -n_candidates)[-n_candidates:]
+
+    peak_scores = combined_score[peak_idx]
+    sort_order  = np.argsort(peak_scores)[::-1]
+    sorted_idx  = peak_idx[sort_order]
     n_peaks_total = len(sorted_idx)
     if n_peaks_total <= n_candidates:
         oversample_factor = 1.0
     else:
-        loudest           = peak_hfc[sort_order[0]] + 1e-12
-        rel               = peak_hfc[sort_order] / loudest
+        loudest           = peak_scores[sort_order[0]] + 1e-12
+        rel               = peak_scores[sort_order] / loudest
         cum               = np.cumsum(rel)
         knee              = np.searchsorted(cum, 0.80 * cum[-1])
         sig               = max(n_candidates, knee + 1)
         n_top             = min(n_candidates * 2, n_peaks_total // 2 + 1)
-        top_ratio         = np.sum(peak_hfc[sort_order[:n_top]]) / (np.sum(peak_hfc) + 1e-12)
+        top_ratio         = np.sum(peak_scores[sort_order[:n_top]]) / (np.sum(peak_scores) + 1e-12)
         spread            = 1.0 / (top_ratio + 0.05)
         oversample_factor = 1.0 + (sig / n_candidates) * spread
     n_take = min(n_peaks_total, int(n_candidates * oversample_factor + 0.5))
@@ -201,53 +250,77 @@ def _fft_candidates(
 # ─────────────────────────────────────────────────────────────
 #  Greedy Peak Tracker
 # ─────────────────────────────────────────────────────────────
+@njit(cache=True)
 def _track_greedy(
-    cand_f: np.ndarray, cand_a: np.ndarray,
-    prev_f: np.ndarray, prev_a: np.ndarray,
-    prevprev_f: np.ndarray,
-    n_partials: int,
-    cooldowns: np.ndarray,
-    cooldown_frames: int = SLOT_COOLDOWN,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    cand_f, cand_a,
+    prev_f, prev_a,
+    prevprev_f,
+    n_partials,
+    cooldowns,
+    cooldown_frames=1,
+):
     out_f = np.zeros(n_partials, dtype=np.float32)
     out_a = np.zeros(n_partials, dtype=np.float32)
-    cooldowns = np.maximum(0, cooldowns - 1)
+    cooldowns[:] = np.maximum(0, cooldowns - 1)
+
     if len(cand_f) == 0:
         return out_f, out_a, cooldowns
-    claimed = np.zeros(len(cand_f), dtype=bool)
-    active  = np.where(prev_a > 0)[0]
-    active  = active[np.argsort(prev_a[active])[::-1]]
-    for slot in active:
-        if claimed.all():
+
+    claimed = np.zeros(len(cand_f), dtype=np.bool_)
+    active = np.where(prev_a > 0)[0]
+    # sort active by descending amplitude
+    for i in range(len(active)):
+        for j in range(i+1, len(active)):
+            if prev_a[active[j]] > prev_a[active[i]]:
+                active[i], active[j] = active[j], active[i]
+
+    for slot_idx in active:
+        if np.all(claimed):
             break
-        predicted_f = prev_f[slot]
-        sc            = predicted_f
-        tol           = max(sc * 0.038, (24.7 + 0.108 * sc) * 0.55)
-        dists         = np.where(~claimed, np.abs(cand_f - sc), np.inf)
-        bi            = int(np.argmin(dists))
-        tol          *= 1.25 if cand_f[bi] > sc else 0.85
-        eps = 1e-12  # avoid log(0)
-        tol *= 1 - np.log1p(prev_a[slot] + eps)/np.log1p(9 + eps)
-        tol          *= min(2.0, 1.0 + (abs(prev_f[slot] - prevprev_f[slot])
-                        if prevprev_f[slot] > 1e-3 else 0.0) / 80.0)
+
+        predicted_f = prev_f[slot_idx]
+        sc = predicted_f
+        tol = max(sc * 0.038, (24.7 + 0.108 * sc) * 0.55)
+        dists = np.where(~claimed, np.abs(cand_f - sc), 1e12)
+        bi = np.argmin(dists)
+        tol *= 1.25 if cand_f[bi] > sc else 0.85
+        eps = 1e-12
+        tol *= 1 - np.log1p(prev_a[slot_idx] + eps)/np.log1p(9 + eps)
+        tol *= min(2.0, 1.0 + (abs(prev_f[slot_idx] - prevprev_f[slot_idx])
+                    if prevprev_f[slot_idx] > 1e-3 else 0.0) / 80.0)
+
         if dists[bi] <= tol * 1.8:
-            out_f[slot] = cand_f[bi]
-            out_a[slot] = cand_a[bi]
+            out_f[slot_idx] = cand_f[bi]
+            out_a[slot_idx] = cand_a[bi]
             claimed[bi] = True
         else:
-            cooldowns[slot] = cooldown_frames
-    births = np.where(~claimed)[0]
-    if len(births):
-        births   = births[np.argsort(cand_a[births])[::-1]]
-        empty    = np.where((out_a == 0) & (cooldowns == 0))[0]
-        n_assign = min(len(births), len(empty))
-        bi_valid = births[:n_assign]
-        mask     = (cand_a[bi_valid] > 1e-6) & (cand_f[bi_valid] > 1e-3)
-        sl, bi_v = empty[:n_assign][mask], bi_valid[mask]
-        out_f[sl] = cand_f[bi_v]
-        out_a[sl] = cand_a[bi_v]
-    return out_f, out_a, cooldowns
+            cooldowns[slot_idx] = cooldown_frames
 
+    # handle new births
+    births_idx = []
+    for i in range(len(claimed)):
+        if not claimed[i]:
+            births_idx.append(i)
+    # sort births by descending amplitude
+    for i in range(len(births_idx)):
+        for j in range(i+1, len(births_idx)):
+            if cand_a[births_idx[j]] > cand_a[births_idx[i]]:
+                births_idx[i], births_idx[j] = births_idx[j], births_idx[i]
+
+    empty_slots = []
+    for i in range(n_partials):
+        if out_a[i] == 0 and cooldowns[i] == 0:
+            empty_slots.append(i)
+
+    n_assign = min(len(births_idx), len(empty_slots))
+    for i in range(n_assign):
+        bi = births_idx[i]
+        sl = empty_slots[i]
+        if cand_a[bi] > 1e-6 and cand_f[bi] > 1e-3:
+            out_f[sl] = cand_f[bi]
+            out_a[sl] = cand_a[bi]
+
+    return out_f, out_a, cooldowns
 # ─────────────────────────────────────────────────────────────
 #  RSC6 Binary Writer
 #
