@@ -21,7 +21,7 @@ from numba import njit
 #  Constants
 # ─────────────────────────────────────────────────────────────
 TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 647768
+DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 2048
@@ -158,6 +158,7 @@ class AnalysisState:
         self.nyquist   = sample_rate / 2.0
         self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
         self.erb       = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
+        self.prev_mags = np.zeros(len(self.freqs), dtype=np.float32)  # starts at zero
         self.ath_lin    = _ath_linear(len(self.freqs), self.sr, self.win)  # shape = FFT bins
 
 # ─────────────────────────────────────────────────────────────
@@ -194,7 +195,7 @@ def _fft_candidates(
     center: int,
     state: AnalysisState,
     n_candidates: int,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float]:   # ← added flux return
     half = state.win // 2
     s, e = center - half, center + half
     n    = len(audio)
@@ -210,8 +211,11 @@ def _fft_candidates(
     snr_ratio = mags / np.maximum(state.ath_lin, 1e-12)  # avoid divide by zero
     snr_score = np.log1p(snr_ratio)                # smooth SNR scaling
     hfc   = mags**2 * state.erb
-    combined_score = hfc * snr_score              # HFC weighted by SNR audibility
-    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-6)
+    diff = np.maximum(mags - state.prev_mags, 0.0)
+    spectral_flux = float(np.sum(diff * diff * state.erb)) + 1   # power * ERB = strong transient boost
+    state.prev_mags[:] = mags
+    combined_score = hfc * snr_score * spectral_flux             # HFC weighted by SNR audibility and spectral flux (transient boost)
+    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-12)
     if len(peak_idx) == 0:
         peak_idx = np.argpartition(combined_score, -n_candidates)[-n_candidates:]
 
@@ -219,20 +223,7 @@ def _fft_candidates(
     sort_order  = np.argsort(peak_scores)[::-1]
     sorted_idx  = peak_idx[sort_order]
     n_peaks_total = len(sorted_idx)
-    if n_peaks_total <= n_candidates:
-        oversample_factor = 1.0
-    else:
-        loudest           = peak_scores[sort_order[0]] + 1e-12
-        rel               = peak_scores[sort_order] / loudest
-        cum               = np.cumsum(rel)
-        knee              = np.searchsorted(cum, 0.80 * cum[-1])
-        sig               = max(n_candidates, knee + 1)
-        n_top             = min(n_candidates * 2, n_peaks_total // 2 + 1)
-        top_ratio         = np.sum(peak_scores[sort_order[:n_top]]) / (np.sum(peak_scores) + 1e-12)
-        spread            = 1.0 / (top_ratio + 0.05)
-        oversample_factor = 1.0 + (sig / n_candidates) * spread
-    n_take = min(n_peaks_total, int(n_candidates * oversample_factor + 0.5))
-    n_take = max(n_take, min(n_candidates, n_peaks_total))
+    n_take = n_peaks_total
     pool_freqs, pool_amps = _parabolic_interp(sorted_idx[:n_take], mags, state.bin_width)
     mask      = (pool_freqs >= 20.0) & (pool_freqs <= state.nyquist - state.bin_width)
     top_freqs = pool_freqs[mask].astype(np.float32)
@@ -476,7 +467,7 @@ def encode(
     print(f"   Frame size     : {frame_size} samp ({1000*frame_size/sample_rate:.2f} ms)"
           f"  |  {n_frames} frames")
     state = AnalysisState(sample_rate)
-    max_meaningful = int(state.nyquist / state.bin_width / state.min_dist)
+    max_meaningful = int(state.win // state.min_dist // 2)
     if n_partials > max_meaningful:
         print(f"   ⚠  Clamping partials {n_partials} → {max_meaningful} "
               f"(max find_peaks can deliver at this window size)")
