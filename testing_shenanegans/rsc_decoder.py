@@ -1,22 +1,33 @@
 from __future__ import annotations
 
 """
-rsc_decoder.py — Roblox Sine Codec (RSC) Decoder
+rsc_decoder.py — Roblox Sine Codec (RSC) Decoder  —  RSC7
 
-Format: RSC6  (see encoder for full spec)
+Format: RSC7  (backward-compatible magic check; RSC6 files still work,
+               they just won't have a noise layer)
 
-Synthesis uses McAulay-Quatieri (MQ) interpolated sinusoidal synthesis:
-  • Amplitude is linearly ramped from the previous frame's value to the current
-    value within each frame — eliminates rectangular-envelope Gibbs ringing.
-  • Phase is accumulated continuously across frames — no inter-frame phase
-    discontinuity regardless of frequency.
-  • Born partials fade in from amplitude 0 with phase starting at 0 — clean onset.
-  • Dead partials fade out to amplitude 0 — clean release with no hard cut.
+Synthesis:
+  • McAulay-Quatieri (MQ) interpolated sinusoidal synthesis (unchanged).
+  • NEW — Noise layer (SMS residual model):
+      For each frame, N_NOISE_BANDS per-band RMS amplitudes are decoded
+      from Section 5 of the file.  White noise is generated, shaped by a
+      linear-interpolated spectral envelope matching those band energies,
+      then added to the sine output.  This recovers transient texture,
+      breathiness, fricatives, and other noise-like components that
+      sinusoidal modelling leaves behind.
 
-All synthesis is done in float32 throughout for ~10× speedup vs float64.
+RSC7 Header (37 bytes):
+  "RSC7" | u8 ver | u32 sr | u32 frame_sz | u16 n_partials |
+  u32 total_samples | u32 total_frames | u16 mask_sz |
+  u8 k_freq | u8 k_amp | u32 born_data_sz | u32 rice_freq_sz |
+  u8 n_noise_bands | u32 noise_data_sz
+
+RSC6 files (35-byte header, magic "RSC6") are still decoded — they just
+produce sinusoidal-only output with no noise layer.
 
 Usage:
     python rsc_decoder.py --input audio.rsc --output decoded.wav
+    python rsc_decoder.py --input audio.rsc --output decoded.wav --no-noise
 """
 
 import argparse
@@ -31,9 +42,12 @@ TWO_PI    = 2.0 * math.pi
 MU        = 255.0
 _LOG1P_MU = math.log1p(MU)
 
+# Number of log-spaced noise bands (must match encoder)
+N_NOISE_BANDS = 32
+
 
 # ─────────────────────────────────────────────────────────────
-#  Mu-law expand  (inverse of encoder's _mulaw_encode)
+#  Mu-law expand
 # ─────────────────────────────────────────────────────────────
 def _mulaw_decode(u: np.ndarray) -> np.ndarray:
     """uint8 [0,255] → float32 [0,1]  (inverse mu-law expansion)"""
@@ -49,7 +63,6 @@ def _zigzag_dec(u: int) -> int:
 
 
 class _BitReader:
-    """MSB-first bit reader over a bytes-like object."""
     __slots__ = ("_data", "_pos", "_buf", "_bits_left")
 
     def __init__(self, data: bytes, start: int):
@@ -77,35 +90,71 @@ class _BitReader:
 
 
 # ─────────────────────────────────────────────────────────────
-#  RSC6 parser
+#  Noise-band edge pre-computation  (mirrors encoder exactly)
 # ─────────────────────────────────────────────────────────────
-def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray]:
+def _noise_band_edges(sample_rate: int, n_bands: int,
+                      f_lo: float = 20.0) -> np.ndarray:
+    f_hi = sample_rate / 2.0
+    return np.exp(np.linspace(np.log(f_lo), np.log(f_hi), n_bands + 1)).astype(np.float32)
+
+
+# ─────────────────────────────────────────────────────────────
+#  RSC6/RSC7 parser
+# ─────────────────────────────────────────────────────────────
+def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray | None]:
+    """
+    Returns:
+        metadata   : dict
+        freqs      : (nF, nP) float32  Hz
+        amps       : (nF, nP) float32  linear [0,1]
+        noise_bands: (nF, n_bands) float32 linear [0,1], or None for RSC6
+    """
     with open(path, "rb") as f:
         raw = f.read()
 
     if len(raw) < 35:
-        raise ValueError("File too short to be RSC6.")
+        raise ValueError("File too short.")
 
-    (magic, version, sample_rate, frame_size, n_partials,
-     total_samples, total_frames, mask_sz, k_freq, k_amp,
-     born_data_sz, rice_freq_sz) = struct.unpack_from("<4sBIIHIIHBBII", raw, 0)
-
-    if magic != b"RSC6":
-        raise ValueError(f"Unknown magic: {magic!r}  (expected RSC6)")
+    magic = raw[:4]
+    if magic == b"RSC6":
+        version = 6
+        (_, version, sample_rate, frame_size, n_partials,
+         total_samples, total_frames, mask_sz, k_freq, k_amp,
+         born_data_sz, rice_freq_sz) = struct.unpack_from("<4sBIIHIIHBBII", raw, 0)
+        n_noise_bands = 0
+        noise_data_sz = 0
+        header_sz     = 35
+    elif magic == b"RSC7":
+        if len(raw) < 37:
+            raise ValueError("RSC7 file too short for header.")
+        (_, version, sample_rate, frame_size, n_partials,
+         total_samples, total_frames, mask_sz, k_freq, k_amp,
+         born_data_sz, rice_freq_sz,
+         n_noise_bands, noise_data_sz) = struct.unpack_from("<4sBIIHIIHBBIIBI", raw, 0)
+        header_sz = 37
+    else:
+        raise ValueError(f"Unknown magic: {magic!r}  (expected RSC6 or RSC7)")
 
     metadata = dict(
         magic=magic.decode(), version=version,
         sample_rate=sample_rate, frame_size=frame_size,
         n_partials=n_partials, total_samples=total_samples,
         total_frames=total_frames,
+        n_noise_bands=n_noise_bands,
     )
 
     # ── Section offsets ───────────────────────────────────────────────────
-    bitmask_start   = 35
+    bitmask_start   = header_sz
     bitmask_sz      = total_frames * 2 * mask_sz
     born_start      = bitmask_start + bitmask_sz
     rice_freq_start = born_start    + born_data_sz
     rice_amp_start  = rice_freq_start + rice_freq_sz
+    noise_start     = rice_amp_start  + (len(raw) - rice_amp_start - noise_data_sz) \
+                      if n_noise_bands > 0 else None
+
+    # Simpler: noise section is the last noise_data_sz bytes
+    if n_noise_bands > 0:
+        noise_start = len(raw) - noise_data_sz
 
     nyquist    = sample_rate / 2.0
     freq_scale = nyquist / 65535.0
@@ -157,36 +206,94 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray]:
             amps_mu[i, slot] = curr_amu[slot]
 
     amps = _mulaw_decode(amps_mu)
-    return metadata, freqs, amps
+
+    # ── Pass 4: noise bands (RSC7 only) ──────────────────────────────────
+    noise_bands_linear = None
+    if n_noise_bands > 0 and noise_start is not None:
+        nb_raw = np.frombuffer(raw, dtype=np.uint8,
+                               count=total_frames * n_noise_bands,
+                               offset=noise_start).reshape(total_frames, n_noise_bands)
+        noise_bands_linear = _mulaw_decode(nb_raw)   # (nF, nB) float32 [0,1]
+
+    return metadata, freqs, amps, noise_bands_linear
+
+
+# ─────────────────────────────────────────────────────────────
+#  Noise synthesis
+# ─────────────────────────────────────────────────────────────
+def synthesize_noise(
+    noise_bands:  np.ndarray,   # (nF, n_bands) float32 [0,1]
+    frame_size:   int,
+    sample_rate:  int,
+    rng:          np.random.Generator,
+) -> np.ndarray:
+    """
+    Synthesise the noise residual layer.
+
+    For each frame:
+      1. Generate white noise of length frame_size.
+      2. FFT it, scale each bin by the linearly-interpolated spectral
+         envelope derived from the per-band RMS amplitudes.
+      3. IFFT back to time domain.
+      4. Apply a Hann window to avoid frame-edge clicks, overlap-add.
+
+    The overlap-add (OLA) with 50% overlap ensures smooth transitions
+    between frames — identical to SMS-style noise synthesis.
+
+    Returns float32 array of length nF * frame_size.
+    """
+    nF, n_bands    = noise_bands.shape
+    T              = frame_size
+    hop            = T // 2          # 50 % overlap
+    total_len      = nF * T + hop    # extra hop for OLA tail
+    output         = np.zeros(total_len, dtype=np.float32)
+    win            = np.sqrt(np.hanning(T)).astype(np.float32)  # sqrt-Hann for OLA
+    fft_freqs      = np.fft.rfftfreq(T, d=1.0 / sample_rate).astype(np.float32)
+    n_bins         = len(fft_freqs)
+    edges          = _noise_band_edges(sample_rate, n_bands)
+    band_centers   = np.sqrt(edges[:-1] * edges[1:]).astype(np.float32)  # geometric center
+
+    for i in range(nF):
+        # Build spectral envelope by linear-interp of band amplitudes onto FFT bins
+        # np.interp clamps at endpoints — correct behaviour
+        env    = np.interp(fft_freqs, band_centers, noise_bands[i]).astype(np.float32)
+
+        # White noise → frequency domain
+        noise  = rng.standard_normal(T).astype(np.float32) * win
+        spec   = np.fft.rfft(noise)
+
+        # Shape by envelope
+        spec  *= env.astype(np.complex64)
+
+        # Back to time
+        frame  = np.fft.irfft(spec, n=T).astype(np.float32)
+
+        # Overlap-add at current frame start (frames placed every T samples,
+        # with an extra OLA window one hop before)
+        start  = i * T
+        output[start        : start + T ] += frame * win
+        # Second copy shifted by hop for smooth transitions
+        if start + hop + T <= total_len:
+            output[start + hop : start + hop + T] += frame * win * 0.5
+
+    # Trim to nF*T
+    return output[:nF * T]
 
 
 # ─────────────────────────────────────────────────────────────
 #  McAulay-Quatieri Interpolated Synthesis  (click-free)
 # ─────────────────────────────────────────────────────────────
 def synthesize(
-    freqs:       np.ndarray,   # (n_frames, n_partials) float32, Hz
-    amps:        np.ndarray,   # (n_frames, n_partials) float32, linear [0,1]
+    freqs:       np.ndarray,
+    amps:        np.ndarray,
     frame_size:  int,
     sample_rate: int,
+    noise_bands: np.ndarray | None = None,   # (nF, nB) float32, or None
+    noise_gain:  float = 1.0,
 ) -> np.ndarray:
     """
-    Phase-continuous, amplitude-interpolated sinusoidal synthesis.
-
-    Within each frame, for each active partial:
-      amp(t)   = prev_amp + (curr_amp - prev_amp) * t/T      — linear ramp
-      phase(t) = phi_0 + 2π · f · t                          — constant freq
-      phi_0    is carried across frame boundaries for continuity
-
-    Birth (prev_amp == 0): amplitude ramps from 0 → clean fade-in.
-    Death (curr_amp == 0): amplitude ramps to 0 → clean fade-out,
-                           then phi is zeroed so any future rebirth starts clean.
-
-    The frequency-kink at frame boundaries (constant-freq approximation) is
-    inaudible in practice because:
-      a) The amplitude is near-zero at birth/death (the discontinuous moments).
-      b) Continuous partials have smooth frequency tracks from the encoder.
-
-    All arithmetic is float32 for speed (~10x faster than float64 for sin).
+    Phase-continuous, amplitude-interpolated sinusoidal synthesis
+    + optional noise layer.
     """
     n_frames, n_partials = freqs.shape
     T       = frame_size
@@ -194,69 +301,49 @@ def synthesize(
     TWO_PI  = np.float32(2.0 * math.pi)
     output  = np.zeros(T * n_frames, dtype=np.float32)
 
-    # Per-frame time ramps — shape (T,), float32
     t_sec  = np.arange(T, dtype=np.float32) / np.float32(sample_rate)
-    t_norm = np.arange(T, dtype=np.float32) / np.float32(T)   # 0 .. (T-1)/T
+    t_norm = np.arange(T, dtype=np.float32) / np.float32(T)
 
-    f32 = freqs.astype(np.float32)    # (F, P)
-    a32 = amps.astype(np.float32)     # (F, P)
+    f32 = freqs.astype(np.float32)
+    a32 = amps.astype(np.float32)
 
-    # Shift-by-one to get previous-frame values (prev[0] = zeros = silence)
-    prev_f = np.vstack([np.zeros((1, n_partials), np.float32), f32[:-1]])  # (F, P)
-    prev_a = np.vstack([np.zeros((1, n_partials), np.float32), a32[:-1]])  # (F, P)
+    prev_f = np.vstack([np.zeros((1, n_partials), np.float32), f32[:-1]])
+    prev_a = np.vstack([np.zeros((1, n_partials), np.float32), a32[:-1]])
 
-    # During a fade-out (curr_f == 0), hold the previous frequency so the
-    # partial doesn't chirp down to 0 Hz — it just fades out at its last pitch.
-    f_use = np.where(f32 > 0, f32, prev_f)   # (F, P)
+    f_use  = np.where(f32 > 0, f32, prev_f)
+    active = (a32 > 0) | (prev_a > 0)
 
-    # Active mask: frames where either prev or curr amplitude is nonzero
-    active = (a32 > 0) | (prev_a > 0)        # (F, P) bool
-
-    # Accumulated per-partial phase at the start of each frame.
-    # Computed sequentially (O(F*P) additions) — fast, ~3ms for 8224*384.
     phi = np.zeros(n_partials, dtype=np.float32)
     phi_track = np.zeros((n_frames, n_partials), dtype=np.float32)
 
     for i in range(n_frames):
-        # Born partials start with phase 0 (phi is already 0 from a previous
-        # death reset, but we explicitly zero it here for clarity).
         born = (prev_a[i] == 0) & (a32[i] > 0)
         phi  = np.where(born, np.float32(0.0), phi)
-
         phi_track[i] = phi
-
-        # Advance phase by 2π·f·T for all partials (even inactive ones —
-        # the phase of an inactive partial is irrelevant since we reset it
-        # to 0 on death, but advancing prevents stale values if needed).
         phi = (phi + TWO_PI * f_use[i] * T_sec) % TWO_PI
-
-        # Zero phase after death so any future birth starts at phase 0.
         phi = np.where(a32[i] == 0, np.float32(0.0), phi)
 
-    # ── Main synthesis loop: one iteration per frame, vectorized over partials
     for i in tqdm(range(n_frames), desc="   Synthesis",
                   unit="frame", dynamic_ncols=True,
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} frames  [{elapsed}<{remaining}  {rate_fmt}]"):
-        act = active[i]               # (P,) bool mask
+        act = active[i]
         if not act.any():
             continue
 
-        pf  = prev_f[i, act]          # (K,) previous frame frequency
-        pa  = prev_a[i, act]          # (K,) previous frame amplitude
-        ca  = a32[i, act]             # (K,) current frame amplitude
-        fu  = f_use[i, act]           # (K,) frequency to use (held on death)
-        ph  = phi_track[i, act]       # (K,) phase at frame start
+        pa  = prev_a[i, act]
+        ca  = a32[i, act]
+        fu  = f_use[i, act]
+        ph  = phi_track[i, act]
 
-        # Phase trajectory within this frame: φ(t) = φ₀ + 2π·f·t
-        # Shape: (K, T) via broadcasting — no Python loop, pure numpy
-        phase   = ph[:, None] + TWO_PI * fu[:, None] * t_sec[None, :]   # (K, T)
-
-        # Linear amplitude envelope from prev to curr — float32 sin is ~10x
-        # faster than float64 on modern hardware with vector extensions
-        amp_env = pa[:, None] + (ca - pa)[:, None] * t_norm[None, :]    # (K, T)
-
-        # Sum all K partials into this frame's output samples
+        phase   = ph[:, None] + TWO_PI * fu[:, None] * t_sec[None, :]
+        amp_env = pa[:, None] + (ca - pa)[:, None] * t_norm[None, :]
         output[i * T : (i + 1) * T] = (amp_env * np.sin(phase)).sum(axis=0)
+
+    # ── Add noise layer ───────────────────────────────────────────────────
+    if noise_bands is not None and noise_gain > 0.0:
+        rng   = np.random.default_rng(seed=0)   # deterministic for reproducibility
+        noise = synthesize_noise(noise_bands, T, sample_rate, rng)
+        output += noise.astype(np.float32) * np.float32(noise_gain)
 
     return output
 
@@ -276,16 +363,21 @@ def write_wav(path: str, samples: np.ndarray, sample_rate: int) -> None:
 #  Main
 # ─────────────────────────────────────────────────────────────
 def decode(input_path: str, output_path: str,
-           override_sr: int | None, trim: bool) -> None:
+           override_sr: int | None, trim: bool,
+           noise_gain: float) -> None:
     print(f"🔊 RSC Decoder  —  {input_path}")
-    meta, freqs, amps = parse_rsc(input_path)
+    meta, freqs, amps, noise_bands = parse_rsc(input_path)
     sr         = override_sr or meta["sample_rate"]
     frame_size = meta["frame_size"]
     dur        = meta["total_samples"] / sr
+    has_noise  = noise_bands is not None
     print(f"   {meta['total_frames']} frames  |  {meta['n_partials']} partials  "
-          f"|  {sr} Hz  |  {dur:.2f}s")
+          f"|  {sr} Hz  |  {dur:.2f}s  |  "
+          f"noise={'yes (' + str(meta['n_noise_bands']) + ' bands)' if has_noise else 'none (RSC6)'}")
 
-    output = synthesize(freqs, amps, frame_size, sr)
+    output = synthesize(freqs, amps, frame_size, sr,
+                        noise_bands=noise_bands,
+                        noise_gain=noise_gain)
     if trim and meta.get("total_samples"):
         output = output[:meta["total_samples"]]
     peak = np.max(np.abs(output))
@@ -296,15 +388,20 @@ def decode(input_path: str, output_path: str,
 
 
 def main():
-    p = argparse.ArgumentParser(description="RSC6 Decoder",
+    p = argparse.ArgumentParser(description="RSC6/RSC7 Decoder",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--input",      "-i", required=True)
     p.add_argument("--output",     "-o", default=None)
     p.add_argument("--samplerate", "-r", type=int, default=None, choices=[22050, 44100])
     p.add_argument("--no-trim",         action="store_true")
+    p.add_argument("--no-noise",        action="store_true",
+                   help="Disable noise layer (sinusoidal-only output)")
+    p.add_argument("--noise-gain",      type=float, default=1.0,
+                   help="Scale factor for noise layer amplitude (default 1.0)")
     args = p.parse_args()
     out  = args.output or (args.input.removesuffix(".rsc") + "_decoded.wav")
-    decode(args.input, out, args.samplerate, not args.no_trim)
+    decode(args.input, out, args.samplerate, not args.no_trim,
+           noise_gain=0.0 if args.no_noise else args.noise_gain)
 
 if __name__ == "__main__":
     main()

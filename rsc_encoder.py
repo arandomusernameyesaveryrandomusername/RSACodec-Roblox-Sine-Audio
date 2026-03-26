@@ -212,10 +212,10 @@ def _fft_candidates(
     snr_score = np.log1p(snr_ratio)                # smooth SNR scaling
     hfc   = mags**2 * state.erb
     diff = np.maximum(mags - state.prev_mags, 0.0)
-    spectral_flux = float(np.sum(diff * diff * state.erb)) + 1   # power * ERB = strong transient boost
+    spectral_flux = float(np.sum(diff * diff * state.erb + 1.0))   # power * ERB = strong transient boost
     state.prev_mags[:] = mags
-    combined_score = hfc * snr_score * spectral_flux             # HFC weighted by SNR audibility and spectral flux (transient boost)
-    peak_idx, _ = find_peaks(mags, distance=state.min_dist, height=1e-12)
+    combined_score = hfc * spectral_flux * snr_score            # HFC weighted by SNR audibility and spectral flux (transient boost)
+    peak_idx, _ = find_peaks(combined_score, distance=state.min_dist, height=1e-12)
     if len(peak_idx) == 0:
         peak_idx = np.argpartition(combined_score, -n_candidates)[-n_candidates:]
 

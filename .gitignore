@@ -1,3 +1,4 @@
+# Ignore audio files
 *.mp3
 *.wav
 *.flac
@@ -12,3 +13,5 @@ venv/
 __pycache__/
 *.pyc
 *.pyo
+# Roblox Specific
+*.lock
