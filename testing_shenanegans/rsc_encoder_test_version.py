@@ -358,7 +358,7 @@ def _fft_candidates(
     snr_score = np.log1p(snr_ratio)
     hfc   = mags * state.erb
     diff  = np.maximum(mags - state.prev_mags, 0.0)
-    spectral_flux = float(np.sum(diff * diff * state.erb + 1.0))
+    spectral_flux = float(np.sum(diff * state.erb + 1.0))
     state.prev_mags[:] = mags
     combined_score = hfc * spectral_flux * snr_score
     peak_idx, _ = find_peaks(combined_score, distance=state.min_dist, height=1e-12)
