@@ -11,7 +11,6 @@ import math
 import os
 import struct
 import librosa
-from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import numpy as np
 from scipy.signal import find_peaks, windows
@@ -26,9 +25,8 @@ DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 2048
 SLOT_COOLDOWN      = 1
-MU                 = 255.0
 ALIVE_THRESHOLD    = 0
-_LOG1P_MU          = math.log1p(MU)
+
 
 def _ath_db(freq: np.ndarray) -> np.ndarray:
     """
@@ -74,12 +72,11 @@ def _ath_linear(n_bins: int, sample_rate: int, win: int,
     return ath_lin.astype(np.float32)
 
 # ─────────────────────────────────────────────────────────────
-#  Mu-law
+#  Linear Quantization
 # ─────────────────────────────────────────────────────────────
-def _mulaw_encode(x: np.ndarray) -> np.ndarray:
-    """float32 [0,1] → uint8 [0,255]"""
-    x = np.clip(x.astype(np.float64), 0.0, 1.0)
-    return np.clip(np.round(MU * np.log1p(MU * x) / _LOG1P_MU), 0, 255).astype(np.uint8)
+def _linear_encode(x: np.ndarray) -> np.ndarray:
+    """float32 [0,1] → uint16 [0,65535]  (16-bit linear quantization)"""
+    return np.clip(np.round(x * 65535.0), 0, 65535).astype(np.uint16)
 
 # ─────────────────────────────────────────────────────────────
 #  Rice helpers
@@ -96,7 +93,7 @@ def _optimal_k(vals: np.ndarray) -> int:
         return 0
     v64 = vals.astype(np.int64)
     best_k, best_bits = 0, float("inf")
-    for k in range(16):
+    for k in range(17):
         bits = int((v64 >> k).sum()) + n * (1 + k)
         if bits < best_bits:
             best_bits, best_k = bits, k
@@ -150,7 +147,7 @@ class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = windows.hann(analysis_win).astype(np.float32)
+        self.window    = windows.blackman(analysis_win).astype(np.float32)
         self.win_scale = 1.0 / float(np.sum(self.window))
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
@@ -210,7 +207,7 @@ def _fft_candidates(
     mags  = np.abs(spec).astype(np.float32) * state.win_scale
     snr_ratio = mags / np.maximum(state.ath_lin, 1e-12)  # avoid divide by zero
     snr_score = np.log1p(snr_ratio)                # smooth SNR scaling
-    diff = np.maximum(mags - state.prev_mags, 0.0)
+    diff = np.maximum(np.log1p(mags) - np.log1p(state.prev_mags), 0.0)
     spectral_flux = float(np.sum(diff * state.erb + 1.0))   # power * ERB = strong transient boost
     state.prev_mags[:] = mags
     combined_score = mags * spectral_flux * snr_score            # HFC weighted by SNR audibility and spectral flux (transient boost)
@@ -336,7 +333,7 @@ def write_rsc(
     mask_sz    = (n_partials + 7) // 8
     freq_scale = 65535.0 / (sample_rate / 2.0)
     f_q  = np.clip(np.round(frame_freqs * freq_scale), 0, 65535).astype(np.int32)
-    a_mu = _mulaw_encode(frame_amps)                                # (F, P) uint8
+    a_lin = _linear_encode(frame_amps)   # uint16 now, was uint8 
 
     # ── Vectorised Pass 1 ────────────────────────────────────────────────
     #
@@ -352,14 +349,14 @@ def write_rsc(
     continuing = alive & was_alive
 
     f_q_prev  = np.vstack([np.zeros((1, n_partials), np.int32), f_q[:-1]])
-    amu_prev  = np.vstack([np.zeros((1, n_partials), np.int32), a_mu[:-1].astype(np.int32)])
+    amu_prev  = np.vstack([np.zeros((1, n_partials), np.int32), a_lin[:-1].astype(np.int32)])
 
     df_mat = (f_q - f_q_prev).astype(np.int32)
-    da_mat = (a_mu.astype(np.int32) - amu_prev)
+    da_mat = (a_lin.astype(np.int32) - amu_prev)
 
     overflow = continuing & (
         (df_mat < -32768) | (df_mat > 32767) |
-        (da_mat <   -128) | (da_mat >    127)
+        (da_mat < -32768) | (da_mat >  32767)
     )
     born_bits_mat = nat_born | overflow
     valid_cont    = continuing & ~overflow
@@ -381,11 +378,12 @@ def write_rsc(
     br, bc = np.where(born_bits_mat)          # ascending frame then slot
     if len(br):
         bfq  = f_q [br, bc].astype(np.uint16)
-        bamu = a_mu[br, bc]
-        raw  = np.empty(len(br) * 3, np.uint8)
-        raw[0::3] = (bfq & 0xFF).astype(np.uint8)
-        raw[1::3] = (bfq >> 8  ).astype(np.uint8)
-        raw[2::3] = bamu
+        bamu = a_lin[br, bc]                  # renamed from a_mu → a_lin
+        raw  = np.empty(len(br) * 4, np.uint8)
+        raw[0::4] = (bfq  & 0xFF).astype(np.uint8)
+        raw[1::4] = (bfq  >> 8  ).astype(np.uint8)
+        raw[2::4] = (bamu & 0xFF).astype(np.uint8)
+        raw[3::4] = (bamu >> 8  ).astype(np.uint8)
         born_buf = raw.tobytes()
     else:
         born_buf = b""
@@ -441,7 +439,6 @@ def encode(
     output_path: str,
     n_partials: int,
     target_sr: int,
-    n_workers: int,
 ) -> None:
     print(f"RSC Encoder  --  {input_path}")
     print(f"   Partials/frame : {n_partials}  |  Target SR: {target_sr} Hz")
@@ -473,20 +470,18 @@ def encode(
         n_partials = max_meaningful
     n_cand = n_partials
     print(f"   Analysis win   : {ANALYSIS_WIN} samp ({state.bin_width:.1f} Hz/bin)"
-          f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN}  workers={n_workers}")
+      f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN}")
 
     # ── Phase 1: parallel FFT candidate extraction ────────────────────────
     # numpy's FFT releases the GIL, so threads genuinely parallelise here.
     # _fft_candidates only reads state.pad_buf (via .copy()) — thread-safe.
     centers = [i * frame_size + frame_size // 2 for i in range(n_frames)]
-    print(f"   Extracting FFT candidates ({n_workers} thread(s)) ...")
+    print(f"   Extracting FFT candidates...")
 
     def _extract(center: int) -> tuple[np.ndarray, np.ndarray]:
         return _fft_candidates(samples, center, state, n_cand)
 
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        # wrap centers in tqdm for progress
-        candidates = list(pool.map(_extract, tqdm(centers, desc="FFT extraction")))
+    candidates = [_extract(c) for c in tqdm(centers, desc="FFT extraction")]
 
     # ── Phase 2: sequential greedy tracking ──────────────────────────────
     # Tracking is inherently serial (each frame depends on the previous),
@@ -523,12 +518,9 @@ def main() -> None:
     p.add_argument("--partials",   "-n", type=int, default=DEFAULT_PARTIALS)
     p.add_argument("--samplerate", "-r", type=int, default=DEFAULT_SAMPLERATE,
                    choices=[22050, 44100])
-    p.add_argument("--workers",    "-w", type=int,
-                   default=min(8, os.cpu_count() or 1),
-                   help="Thread count for parallel FFT candidate extraction")
     args = p.parse_args()
     out  = args.output or (args.input.removesuffix(".wav") + RSC_EXTENSION)
-    encode(args.input, out, args.partials, args.samplerate, args.workers)
+    encode(args.input, out, args.partials, args.samplerate)
 
 if __name__ == "__main__":
     main()

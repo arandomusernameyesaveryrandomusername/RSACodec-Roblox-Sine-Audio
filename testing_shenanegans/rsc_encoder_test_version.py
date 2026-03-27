@@ -35,7 +35,6 @@ import math
 import os
 import struct
 import librosa
-from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import numpy as np
 from scipy.signal import find_peaks, windows
@@ -585,7 +584,6 @@ def encode(
     output_path: str,
     n_partials: int,
     target_sr: int,
-    n_workers: int,
 ) -> None:
     print(f"RSC Encoder  --  {input_path}")
     print(f"   Partials/frame : {n_partials}  |  Target SR: {target_sr} Hz")
@@ -617,17 +615,16 @@ def encode(
         n_partials = max_meaningful
     n_cand = n_partials
     print(f"   Analysis win   : {ANALYSIS_WIN} samp ({state.bin_width:.1f} Hz/bin)"
-          f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN}  workers={n_workers}")
+          f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN} frames")
 
     # ── Phase 1: parallel FFT candidate extraction ────────────────────────
     centers = [i * frame_size + frame_size // 2 for i in range(n_frames)]
-    print(f"   Extracting FFT candidates ({n_workers} thread(s)) ...")
+    print(f"   Extracting FFT candidates...")
 
     def _extract(center: int) -> tuple[np.ndarray, np.ndarray]:
         return _fft_candidates(samples, center, state, n_cand)
 
-    with ThreadPoolExecutor(max_workers=n_workers) as pool:
-        candidates = list(pool.map(_extract, tqdm(centers, desc="FFT extraction")))
+    candidates = [_extract(c) for c in tqdm(centers, desc="FFT extraction")]
 
     # ── Phase 2: sequential greedy tracking ──────────────────────────────
     print(f"   Tracking partials ...")
@@ -670,12 +667,9 @@ def main() -> None:
     p.add_argument("--partials",   "-n", type=int, default=DEFAULT_PARTIALS)
     p.add_argument("--samplerate", "-r", type=int, default=DEFAULT_SAMPLERATE,
                    choices=[22050, 44100])
-    p.add_argument("--workers",    "-w", type=int,
-                   default=min(8, os.cpu_count() or 1),
-                   help="Thread count for parallel FFT candidate extraction")
     args = p.parse_args()
     out  = args.output or (args.input.removesuffix(".wav") + RSC_EXTENSION)
-    encode(args.input, out, args.partials, args.samplerate, args.workers)
+    encode(args.input, out, args.partials, args.samplerate)
 
 if __name__ == "__main__":
     main()

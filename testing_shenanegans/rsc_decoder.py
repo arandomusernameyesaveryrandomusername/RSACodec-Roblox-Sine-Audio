@@ -176,7 +176,7 @@ def parse_rsc(path: str) -> tuple[dict, np.ndarray, np.ndarray, np.ndarray | Non
 
     # ── Pass 3: reconstruct freq/amp arrays ──────────────────────────────
     freqs   = np.zeros((total_frames, n_partials), dtype=np.float32)
-    amps_mu = np.zeros((total_frames, n_partials), dtype=np.uint8)
+    amps_mu= np.zeros((total_frames, n_partials), dtype=np.uint16)
 
     curr_fq  = np.zeros(n_partials, dtype=np.int32)
     curr_amu = np.zeros(n_partials, dtype=np.int32)

@@ -63,20 +63,6 @@ local EQ_COUNT = 12
 local EQ_SCALE = 1200.0   -- EQ_MAX_H(100) * EQ_GAIN(3.0) — precomputed
 
 -- ══════════════════════════════════════════════════
--- MU-LAW LOOKUP TABLE  (replaces math.pow per partial per frame)
--- Index 0..255 → decoded amplitude in [0, 1]
--- ══════════════════════════════════════════════════
-local MULAW_LUT = tcreate(256, 0)
-do
-	local ONE_PLUS_MU = 256.0
-	local INV_MU      = 1.0 / 255.0
-	for y = 1, 255 do
-		MULAW_LUT[y] = (pow(ONE_PLUS_MU, y * INV_MU) - 1.0) * INV_MU
-	end
-	-- MULAW_LUT[0] remains 0 from tcreate
-end
-
--- ══════════════════════════════════════════════════
 -- BIT-MASK LOOKUP  (avoids lshift inside tight loops)
 -- BIT_MASK[bitInByte+1] where bitInByte = slot % 8
 -- ══════════════════════════════════════════════════
@@ -194,10 +180,11 @@ local function decodeFrames(raw, hdr)
 
 				if born then
 					-- Absolute encoding: uint16 fq + uint8 amu (inlined)
-					local ba, bb = byte(raw, bornPos, bornPos + 1)
-					local fq     = ba + bb * 256
-					local amu    = byte(raw, bornPos + 2)
-					bornPos = bornPos + 3
+                    local ba, bb = byte(raw, bornPos, bornPos + 1)
+                    local fq     = ba + bb * 256
+                    local ac, ad = byte(raw, bornPos + 2, bornPos + 3)
+                    local amu    = ac + ad * 256
+                    bornPos = bornPos + 4
 					currFq [slot1] = fq
 					currAmu[slot1] = amu
 				else
@@ -259,12 +246,12 @@ local function decodeFrames(raw, hdr)
 						else
 							delta = -rshift(zz + 1, 1)
 						end
-						currAmu[slot1] = currAmu[slot1] + delta
+						currAmu[slot1] = clamp(currAmu[slot1] + delta, 0, 65535)
 					end
 				end
 
 				freqs[frameBase + slot1] = currFq [slot1] * fScale
-				amps [frameBase + slot1] = MULAW_LUT[currAmu[slot1]] or 0
+				amps[frameBase + slot1] = currAmu[slot1] / 65535.0
 			else
 				-- Dead — reset accumulators, leave freqs/amps at 0
 				currFq [slot1] = 0
