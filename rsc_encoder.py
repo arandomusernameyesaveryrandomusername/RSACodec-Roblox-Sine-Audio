@@ -147,7 +147,7 @@ class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = windows.blackman(analysis_win).astype(np.float32)
+        self.window    = windows.blackman(analysis_win, 4).astype(np.float32)
         self.win_scale = 1.0 / float(np.sum(self.window))
         self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.bin_width = float(sample_rate) / analysis_win
@@ -157,6 +157,9 @@ class AnalysisState:
         self.erb       = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
         self.prev_mags = np.zeros(len(self.freqs), dtype=np.float32)  # starts at zero
         self.ath_lin    = _ath_linear(len(self.freqs), self.sr, self.win)  # shape = FFT bins
+        self.lag = 2                    # frames to look back (paper default)
+        self.max_size = 3               # frequency bins for max filter (vibrato suppression width)
+        self.prev_mags_buffer = None    # will hold last 'lag' frames of mags (circular or list)
 
 # ─────────────────────────────────────────────────────────────
 #  Parabolic Peak Interpolation (module-level — no closure overhead)
@@ -208,7 +211,11 @@ def _fft_candidates(
     snr_ratio = mags / np.maximum(state.ath_lin, 1e-12)  # avoid divide by zero
     snr_score = np.log1p(snr_ratio)                # smooth SNR scaling
     diff = np.maximum(np.log1p(mags) - np.log1p(state.prev_mags), 0.0)
-    spectral_flux = float(np.sum(diff * state.erb + 1.0))   # power * ERB = strong transient boost
+    max_filtered_prev = np.maximum.reduce([
+    np.roll(state.prev_mags, shift) for shift in range(-state.max_size//2, state.max_size//2 + 1)
+    ])
+    super_diff = np.maximum(np.log1p(mags) - np.log1p(max_filtered_prev), 0.0)
+    spectral_flux = float(np.sum(super_diff * state.erb + 1.0))   # power * ERB = strong transient boost
     state.prev_mags[:] = mags
     combined_score = mags * spectral_flux * snr_score            # HFC weighted by SNR audibility and spectral flux (transient boost)
     peak_idx, _ = find_peaks(combined_score, distance=state.min_dist, height=1e-12)
