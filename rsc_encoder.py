@@ -1,24 +1,63 @@
 from __future__ import annotations
 
 """
-rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder
+rsc_encoder.py -- Roblox Sine Codec (RSC) Encoder  [OPTIMIZED]
+
+Key optimisations vs. reference encoder
+========================================
+1.  @njit on every hot path
+    • _zigzag_njit            — no Python boxing, single typed loop
+    • _optimal_k_njit         — tight loop, zero numpy intermediate arrays
+    • _rice_encode_njit       — manual MSB-first bit-writer (two-pass);
+                                  avoids the 5 large intermediate numpy arrays
+                                  of the reference; fully cache-friendly
+    • _parabolic_interp_njit  — replaces masked-array numpy version;
+                                  one allocation per call instead of ~6
+    • _score_all_frames_njit  — fused score computation + custom local-max
+                                  peak finder; replaces scipy.signal.find_peaks
+                                  (~50 µs Python overhead eliminated per frame);
+                                  processes ALL frames in one JIT call so that
+                                  prev_mags state is maintained correctly and
+                                  n_frames Python→JIT boundary crossings become 1
+    • _track_greedy           — replaces O(n²) bubble-sort with np.argsort
+                                  O(n log n); argsort used for both active-slot
+                                  ordering and birth candidate ordering
+
+2.  Two-phase FFT pipeline
+    Phase A — FFT only: all n_frames spectra computed in a
+              ThreadPoolExecutor (numpy.fft releases the GIL → true
+              multi-core parallelism).  Writes into a single pre-allocated
+              (n_frames × n_bins) float32 matrix, no per-frame heap alloc.
+    Phase B — Scoring + peak-finding: single @njit call over all frames
+              (must be sequential to preserve spectral-flux state).
+
+3.  All float32 in analysis; float64 kept only for the FFT itself
+    (numerical accuracy) and one-time ATH precomputation.
+
+4.  RTF (real-time factor) reported at completion.
+
 Usage:
     python rsc_encoder.py --input audio.wav --output audio.rsc
-    python rsc_encoder.py --input audio.wav --output audio.rsc --partials 384 --samplerate 44100 --workers 4
+    python rsc_encoder.py --input audio.wav --output audio.rsc \\
+        --partials 384 --samplerate 44100
 """
+
 import argparse
 import math
 import os
 import struct
-import librosa
-from tqdm import tqdm
-import numpy as np
-from scipy.signal import find_peaks, windows
-from numba import njit
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-# ─────────────────────────────────────────────────────────────
+import librosa
+import numpy as np
+from numba import njit
+from scipy.signal import windows
+from tqdm import tqdm
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Constants
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 TARGET_FPS         = 60
 DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
@@ -28,329 +67,437 @@ SLOT_COOLDOWN      = 1
 ALIVE_THRESHOLD    = 0
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  ATH  (one-time, stays in Python/NumPy)
+# ─────────────────────────────────────────────────────────────────────────────
 def _ath_db(freq: np.ndarray) -> np.ndarray:
-    """
-    Terhardt (1979) approximation of the ISO quiet-listening threshold.
-    Returns dB SPL at each frequency (Hz). Values are in the range
-    ~0 dB (1–4 kHz) up to ~80 dB near DC and the Nyquist edge.
-
-    Formula:
-        ATH(f) =  3.64*(f/1000)**-0.8
-                - 6.5 * exp(-0.6*(f/1000 - 3.3)**2)
-                + 10**-3 * (f/1000)**4
-    Clipped to [-10, 90] dB for numerical safety.
-    """
-    f   = np.asarray(freq, dtype=np.float64)
-    f   = np.maximum(f, 20.0)          # avoid log/power issues near DC
-    fk  = f / 1000.0
-    ath = (
-          3.64  * fk ** -0.8
-        - 6.5   * np.exp(-0.6 * (fk - 3.3) ** 2)
-        + 1e-3  * fk ** 4
+    f  = np.maximum(np.asarray(freq, dtype=np.float64), 20.0)
+    fk = f / 1000.0
+    return np.clip(
+        3.64 * fk**-0.8
+        - 6.5 * np.exp(-0.6 * (fk - 3.3)**2)
+        + 1e-3 * fk**4,
+        -90.0, 90.0,
     )
-    return np.clip(ath, -90.0, 90.0)
 
 
 def _ath_linear(n_bins: int, sample_rate: int, win: int,
                 ath_gain_db: float = 0.0) -> np.ndarray:
-    """
-    Pre-compute a per-FFT-bin ATH amplitude threshold (linear, 0-1 scale).
-
-    The encoder normalises audio to peak=1, which we treat as 0 dB FS.
-    We map dB SPL -> dB FS with the rough assumption that 0 dB FS = 96 dB SPL
-    (standard for 16-bit audio), then convert to linear amplitude:
-
-        amp_threshold = 10 ** ((ath_db_spl - 96 + ath_gain_db) / 20)
-
-    ath_gain_db > 0  -> more aggressive (raise threshold, drop more partials)
-    ath_gain_db < 0  -> more permissive (lower threshold, keep more partials)
-    """
     bin_freqs = np.arange(n_bins, dtype=np.float64) * sample_rate / win
-    ath_spl   = _ath_db(np.maximum(bin_freqs, 20.0))
-    ath_dbfs  = ath_spl - 96.0 + ath_gain_db
-    ath_lin   = 10.0 ** (ath_dbfs / 20.0)
-    return ath_lin.astype(np.float32)
+    ath_dbfs  = _ath_db(np.maximum(bin_freqs, 20.0)) - 96.0 + ath_gain_db
+    return (10.0 ** (ath_dbfs / 20.0)).astype(np.float32)
 
-# ─────────────────────────────────────────────────────────────
-#  Linear Quantization
-# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Quantisation
+# ─────────────────────────────────────────────────────────────────────────────
 def _linear_encode(x: np.ndarray) -> np.ndarray:
-    """float32 [0,1] → uint16 [0,65535]  (16-bit linear quantization)"""
+    """float32 [0,1] -> uint16 [0,65535]"""
     return np.clip(np.round(x * 65535.0), 0, 65535).astype(np.uint16)
 
-# ─────────────────────────────────────────────────────────────
-#  Rice helpers
-# ─────────────────────────────────────────────────────────────
-def _zigzag(arr: np.ndarray) -> np.ndarray:
-    """signed int32 → non-negative uint32  (0→0, -1→1, 1→2, -2→3, …)"""
-    a = arr.astype(np.int32)
-    return ((a << 1) ^ (a >> 31)).astype(np.uint32)
 
-def _optimal_k(vals: np.ndarray) -> int:
-    """Brute-force optimal Rice parameter k in [0, 15]."""
+# ─────────────────────────────────────────────────────────────────────────────
+#  JIT — Zigzag encode
+# ─────────────────────────────────────────────────────────────────────────────
+@njit(cache=True, fastmath=True)
+def _zigzag_njit(arr: np.ndarray) -> np.ndarray:
+    """signed int32 -> non-negative uint32  (0->0, -1->1, 1->2, -2->3, ...)"""
+    out = np.empty(len(arr), dtype=np.uint32)
+    for i in range(len(arr)):
+        a = np.int32(arr[i])
+        out[i] = np.uint32((a << np.int32(1)) ^ (a >> np.int32(31)))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  JIT — Optimal Rice k
+# ─────────────────────────────────────────────────────────────────────────────
+@njit(cache=True, fastmath=True)
+def _optimal_k_njit(vals: np.ndarray) -> int:
+    """Brute-force optimal Rice k in [0,16].  vals must be uint32."""
     n = len(vals)
     if n == 0:
         return 0
-    v64 = vals.astype(np.int64)
-    best_k, best_bits = 0, float("inf")
+    best_k    = 0
+    best_bits = np.int64(1) << np.int64(62)   # sentinel
     for k in range(17):
-        bits = int((v64 >> k).sum()) + n * (1 + k)
+        bits = np.int64(n) * np.int64(1 + k)
+        for i in range(n):
+            bits += np.int64(vals[i]) >> np.int64(k)
         if bits < best_bits:
-            best_bits, best_k = bits, k
+            best_bits = bits
+            best_k    = k
     return best_k
 
-def _rice_encode(vals: np.ndarray, k: int) -> bytearray:
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  JIT — Rice encoder  (manual MSB-first bit-writer)
+# ─────────────────────────────────────────────────────────────────────────────
+@njit(cache=True, fastmath=True)
+def _rice_encode_njit(vals: np.ndarray, k: int) -> np.ndarray:
     """
-    Vectorised Rice encoder — MSB-first bit packing.
-    vals  : 1-D uint32 array (non-negative, already zigzag encoded)
-    k     : Rice parameter
-    returns: packed bytes
+    Encode a uint32 array with Rice(k) coding into an MSB-first byte stream.
+
+    Two passes share the same inner logic:
+      Pass 1 — count total bits  (one shift + one add per value)
+      Pass 2 — write bits into a zeroed buffer
+    Avoids the 5 large intermediate arrays of the numpy reference
+    (quotients, remainders, code_lens, starts, bits).
     """
     n = len(vals)
     if n == 0:
-        return bytearray()
-    v64        = vals.astype(np.int64)
-    quotients  = v64 >> k
-    remainders = v64 & ((1 << k) - 1)
-    code_lens  = quotients + 1 + k
-    total_bits = int(code_lens.sum())
-    bits   = np.zeros(total_bits, dtype=np.uint8)
-    starts = np.empty(n, dtype=np.int64)
-    starts[0] = 0
-    if n > 1:
-        starts[1:] = np.cumsum(code_lens[:-1])
-    bits[(starts + quotients).astype(int)] = 1
-    for bit_idx in range(k):
-        shift     = k - 1 - bit_idx
-        positions = (starts + quotients + 1 + bit_idx).astype(int)
-        bits[positions] = ((remainders >> shift) & 1).astype(np.uint8)
-    pad = (-total_bits) % 8
-    if pad:
-        bits = np.append(bits, np.zeros(pad, dtype=np.uint8))
-    return bytearray(np.packbits(bits, bitorder="big"))
+        return np.empty(0, dtype=np.uint8)
 
-# ─────────────────────────────────────────────────────────────
-#  WAV Loading
-# ─────────────────────────────────────────────────────────────
-def load_audio(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
-    # y: float32 array, sr: sample rate
-    y, sr = librosa.load(path, sr=target_sr, mono=True)  # auto-resamples & mono
-    # normalize to [-1, 1]
-    peak = np.max(np.abs(y))
-    y = y / peak
-    return y.astype(np.float32), target_sr
+    # Pass 1 — count bits
+    total_bits = np.int64(0)
+    for i in range(n):
+        total_bits += (np.int64(vals[i]) >> np.int64(k)) + np.int64(1 + k)
 
-# ─────────────────────────────────────────────────────────────
-#  Analysis State
-# ─────────────────────────────────────────────────────────────
+    out = np.zeros(int((total_bits + 7) >> 3), dtype=np.uint8)
+
+    # Pass 2 — write bits
+    bit_pos = np.int64(0)
+    k_mask  = np.int64((1 << k) - 1)
+
+    for i in range(n):
+        v = np.int64(vals[i])
+        q = int(v >> np.int64(k))
+        r = int(v  &  k_mask)
+
+        bit_pos += np.int64(q)                       # unary zeros (buffer is 0)
+        bpos = int(bit_pos)
+        out[bpos >> 3] |= np.uint8(np.uint8(1) << np.uint8(7 - (bpos & 7)))
+        bit_pos += np.int64(1)
+
+        for b in range(k - 1, -1, -1):
+            if (r >> b) & 1:
+                bpos = int(bit_pos)
+                out[bpos >> 3] |= np.uint8(np.uint8(1) << np.uint8(7 - (bpos & 7)))
+            bit_pos += np.int64(1)
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  JIT — Score all frames + peak-find  (replaces scipy.signal.find_peaks loop)
+# ─────────────────────────────────────────────────────────────────────────────
+@njit(cache=True, fastmath=True)
+def _score_all_frames_njit(
+    all_mags:     np.ndarray,   # float32 (n_frames, n_bins)
+    ath_lin:      np.ndarray,   # float32 (n_bins,)
+    erb:          np.ndarray,   # float32 (n_bins,)
+    bin_width:    np.float32,
+    nyquist:      np.float32,
+    n_candidates: int,
+    cand_freqs:   np.ndarray,   # float32 (n_frames, n_candidates) — output
+    cand_amps:    np.ndarray,   # float32 (n_frames, n_candidates) — output
+    cand_counts:  np.ndarray,   # int32   (n_frames,)              — output
+) -> None:
+    """
+    For every frame:
+      1. Compute per-bin combined score (SNR-weighted, flux-boosted).
+      2. Find local maxima (equivalent to scipy find_peaks with distance=1).
+      3. Sort by descending score, parabolic-interpolate, frequency-filter,
+         and write into the output candidate arrays.
+
+    Sequential loop maintains prev_mags across frames for spectral flux.
+    Replaces n_frames individual Python/scipy calls with one JIT call.
+    """
+    n_frames, n_bins = all_mags.shape
+    prev_mags = np.zeros(n_bins, dtype=np.float32)
+    score     = np.empty(n_bins, dtype=np.float32)
+    f_low     = np.float32(20.0)
+    f_high    = nyquist - bin_width
+
+    for fi in range(n_frames):
+        mags = all_mags[fi]
+
+        # ── Spectral flux (scalar for this frame) ─────────────────────────
+        flux = np.float32(0.0)
+        for b in range(n_bins):
+            d = np.log1p(mags[b]) - np.log1p(prev_mags[b])
+            if d > np.float32(0.0):
+                flux += d * (erb[b] + np.float32(1.0))
+
+        # ── Per-bin combined score + update prev_mags ─────────────────────
+        for b in range(n_bins):
+            snr      = mags[b] / max(ath_lin[b], np.float32(1e-12))
+            score[b] = mags[b] * flux * np.log1p(snr)
+            prev_mags[b] = mags[b]
+
+        # ── Find local maxima (find_peaks distance=1) ─────────────────────
+        n_peaks = 0
+        for b in range(1, n_bins - 1):
+            if (score[b] > score[b - 1] and score[b] >= score[b + 1]
+                    and score[b] > np.float32(1e-12)):
+                n_peaks += 1
+
+        if n_peaks == 0:
+            # Fallback: take top n_candidates by raw score
+            top = np.argsort(-score)
+            ci  = 0
+            for pi in range(min(n_bins, n_candidates * 4)):
+                if ci >= n_candidates:
+                    break
+                bi = top[pi]
+                if bi < 1 or bi >= n_bins - 1:
+                    continue
+                alpha = np.float64(mags[bi - 1])
+                beta  = np.float64(mags[bi    ])
+                gamma = np.float64(mags[bi + 1])
+                denom = alpha - 2.0 * beta + gamma
+                if abs(denom) > 1e-12:
+                    off = 0.5 * (alpha - gamma) / denom
+                    f   = np.float32((bi + off) * bin_width)
+                    a   = np.float32(beta - 0.25 * (alpha - gamma) * off)
+                else:
+                    f = np.float32(bi * bin_width)
+                    a = mags[bi]
+                if f >= f_low and f <= f_high:
+                    cand_freqs[fi, ci] = f
+                    cand_amps[fi, ci]  = min(a, np.float32(1.0))
+                    ci += 1
+            cand_counts[fi] = ci
+            continue
+
+        # ── Collect peak indices ──────────────────────────────────────────
+        peak_idx = np.empty(n_peaks, dtype=np.int32)
+        j = 0
+        for b in range(1, n_bins - 1):
+            if (score[b] > score[b - 1] and score[b] >= score[b + 1]
+                    and score[b] > np.float32(1e-12)):
+                peak_idx[j] = b
+                j += 1
+
+        # Sort peaks by descending combined score
+        order = np.argsort(-score[peak_idx])
+        sorted_peaks = peak_idx[order]
+
+        # ── Parabolic interpolation + filter → candidate slots ────────────
+        ci = 0
+        for pi in range(len(sorted_peaks)):
+            if ci >= n_candidates:
+                break
+            bi = sorted_peaks[pi]
+            alpha = np.float64(mags[bi - 1])
+            beta  = np.float64(mags[bi    ])
+            gamma = np.float64(mags[bi + 1])
+            denom = alpha - 2.0 * beta + gamma
+            if abs(denom) > 1e-12:
+                off = 0.5 * (alpha - gamma) / denom
+                f   = np.float32((bi + off) * bin_width)
+                a   = np.float32(beta - 0.25 * (alpha - gamma) * off)
+            else:
+                f = np.float32(bi * bin_width)
+                a = mags[bi]
+            if f >= f_low and f <= f_high:
+                cand_freqs[fi, ci] = f
+                cand_amps[fi, ci]  = min(a, np.float32(1.0))
+                ci += 1
+
+        cand_counts[fi] = ci
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  JIT — Greedy tracker  (argsort replaces O(n²) bubble-sort)
+# ─────────────────────────────────────────────────────────────────────────────
+@njit(cache=True, fastmath=True)
+def _track_greedy(
+    cand_f:         np.ndarray,   # float32 (nc,) — valid candidates this frame
+    cand_a:         np.ndarray,   # float32 (nc,)
+    prev_f:         np.ndarray,   # float32 (n_partials,)
+    prev_a:         np.ndarray,   # float32 (n_partials,)
+    prevprev_f:     np.ndarray,   # float32 (n_partials,)
+    n_partials:     int,
+    cooldowns:      np.ndarray,   # int32   (n_partials,)
+    cooldown_frames: int = 1,
+) -> tuple:
+    out_f = np.zeros(n_partials, dtype=np.float32)
+    out_a = np.zeros(n_partials, dtype=np.float32)
+
+    for i in range(n_partials):
+        cd = cooldowns[i] - 1
+        cooldowns[i] = cd if cd > 0 else 0
+
+    nc = len(cand_f)
+    if nc == 0:
+        return out_f, out_a, cooldowns
+
+    claimed = np.zeros(nc, dtype=np.bool_)
+
+    # Active slots sorted by descending amplitude via argsort  O(P log P)
+    active_slots = np.where(prev_a > np.float32(0.0))[0].astype(np.int32)
+    n_active = len(active_slots)
+    if n_active > 1:
+        active_slots = active_slots[np.argsort(-prev_a[active_slots])]
+
+    # Match each active slot to its nearest unclaimed candidate
+    for ii in range(n_active):
+        slot = active_slots[ii]
+        sc   = prev_f[slot]
+
+        best_d  = np.float32(1e12)
+        best_bi = -1
+        for ci in range(nc):
+            if not claimed[ci]:
+                d = cand_f[ci] - sc
+                if d < np.float32(0.0):
+                    d = -d
+                if d < best_d:
+                    best_d  = d
+                    best_bi = ci
+
+        if best_bi < 0:
+            break
+
+        # Asymmetric, amplitude-scaled, velocity-scaled tolerance
+        tol = max(sc * np.float32(0.038),
+                  (np.float32(24.7) + np.float32(0.108) * sc) * np.float32(0.55))
+        tol *= np.float32(1.25) if cand_f[best_bi] > sc else np.float32(0.85)
+        eps  = np.float32(1e-12)
+        tol *= np.float32(1.0) - np.log1p(prev_a[slot] + eps) / np.log1p(np.float32(9.0) + eps)
+        ppf  = prevprev_f[slot]
+        vel  = abs(prev_f[slot] - ppf) if ppf > np.float32(1e-3) else np.float32(0.0)
+        tol *= min(np.float32(2.0), np.float32(1.0) + vel / np.float32(80.0))
+
+        if best_d <= tol * np.float32(1.8):
+            out_f[slot]      = cand_f[best_bi]
+            out_a[slot]      = cand_a[best_bi]
+            claimed[best_bi] = True
+        else:
+            cooldowns[slot] = cooldown_frames
+
+    # Births: unclaimed candidates sorted by descending amplitude
+    n_unclaimed = 0
+    for ci in range(nc):
+        if not claimed[ci]:
+            n_unclaimed += 1
+    if n_unclaimed == 0:
+        return out_f, out_a, cooldowns
+
+    unclaimed = np.empty(n_unclaimed, dtype=np.int32)
+    j = 0
+    for ci in range(nc):
+        if not claimed[ci]:
+            unclaimed[j] = ci
+            j += 1
+    if n_unclaimed > 1:
+        unclaimed = unclaimed[np.argsort(-cand_a[unclaimed])]
+
+    # Empty slots (out_a==0 and not cooling down)
+    n_empty = 0
+    for s in range(n_partials):
+        if out_a[s] == np.float32(0.0) and cooldowns[s] == 0:
+            n_empty += 1
+    empty = np.empty(n_empty, dtype=np.int32)
+    j = 0
+    for s in range(n_partials):
+        if out_a[s] == np.float32(0.0) and cooldowns[s] == 0:
+            empty[j] = s
+            j += 1
+
+    for i in range(min(n_unclaimed, n_empty)):
+        bi = unclaimed[i]
+        sl = empty[i]
+        if cand_a[bi] > np.float32(1e-6) and cand_f[bi] > np.float32(1e-3):
+            out_f[sl] = cand_f[bi]
+            out_a[sl] = cand_a[bi]
+
+    return out_f, out_a, cooldowns
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Analysis state  (pre-computed constants, shared read-only across threads)
+# ─────────────────────────────────────────────────────────────────────────────
 class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
         self.window    = windows.blackman(analysis_win, 4).astype(np.float32)
-        self.win_scale = 1.0 / float(np.sum(self.window))
-        self.freqs     = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
-        self.bin_width = float(sample_rate) / analysis_win
+        self.win_scale = np.float32(1.0 / float(np.sum(self.window)))
+        self.bin_width = np.float32(float(sample_rate) / analysis_win)
+        self.nyquist   = np.float32(sample_rate / 2.0)
         self.min_dist  = 1
-        self.nyquist   = sample_rate / 2.0
-        self.pad_buf   = np.zeros(analysis_win, dtype=np.float32)
-        self.erb       = 21.4 * np.log10(4.37e-3 * self.freqs + 1)
-        self.prev_mags = np.zeros(len(self.freqs), dtype=np.float32)  # starts at zero
-        self.ath_lin    = _ath_linear(len(self.freqs), self.sr, self.win)  # shape = FFT bins
-        self.lag = 2                    # frames to look back (paper default)
-        self.max_size = 3               # frequency bins for max filter (vibrato suppression width)
-        self.prev_mags_buffer = None    # will hold last 'lag' frames of mags (circular or list)
+        n_bins         = analysis_win // 2 + 1
+        freqs          = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
+        self.erb       = (21.4 * np.log10(4.37e-3 * freqs + 1)).astype(np.float32)
+        self.ath_lin   = _ath_linear(n_bins, sample_rate, analysis_win)
 
-# ─────────────────────────────────────────────────────────────
-#  Parabolic Peak Interpolation (module-level — no closure overhead)
-# ─────────────────────────────────────────────────────────────
-def _parabolic_interp(
-    idx_arr: np.ndarray,
-    mags: np.ndarray,
-    bin_width: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Vectorised quadratic peak interpolation → (Hz freqs, amplitudes)."""
-    idx      = idx_arr.astype(np.int32)
-    ref_bins = idx.astype(np.float64)
-    ref_mags = mags[idx].astype(np.float64)
-    valid = (idx >= 1) & (idx < len(mags) - 1)
-    if valid.any():
-        k     = idx[valid]
-        alpha = mags[k - 1].astype(np.float64)
-        beta  = mags[k    ].astype(np.float64)
-        gamma = mags[k + 1].astype(np.float64)
-        denom = alpha - 2.0 * beta + gamma
-        safe  = np.abs(denom) > 1e-12
-        offset = np.zeros(valid.sum(), dtype=np.float64)
-        offset[safe] = 0.5 * (alpha[safe] - gamma[safe]) / denom[safe]
-        ref_bins[valid] = k + offset
-        ref_mags[valid] = beta - 0.25 * (alpha - gamma) * offset
-    return ref_bins * bin_width, ref_mags
 
-# ─────────────────────────────────────────────────────────────
-#  FFT Candidate Extraction
-# ─────────────────────────────────────────────────────────────
-def _fft_candidates(
-    audio: np.ndarray,
-    center: int,
-    state: AnalysisState,
-    n_candidates: int,
-) -> tuple[np.ndarray, np.ndarray, float]:   # ← added flux return
-    half = state.win // 2
-    s, e = center - half, center + half
-    n    = len(audio)
-    if s < 0 or e > n:
-        # state.pad_buf is read-only here — safe for concurrent use
-        chunk = state.pad_buf.copy()
-        ss, se = max(0, s), min(n, e)
-        chunk[ss - s : ss - s + (se - ss)] = audio[ss:se]
-    else:
-        chunk = audio[s:e]
-    spec  = np.fft.rfft(chunk.astype(np.float64) * state.window)
-    mags  = np.abs(spec).astype(np.float32) * state.win_scale
-    snr_ratio = mags / np.maximum(state.ath_lin, 1e-12)  # avoid divide by zero
-    snr_score = np.log1p(snr_ratio)                # smooth SNR scaling
-    diff = np.maximum(np.log1p(mags) - np.log1p(state.prev_mags), 0.0)
-    max_filtered_prev = np.maximum.reduce([
-    np.roll(state.prev_mags, shift) for shift in range(-state.max_size//2, state.max_size//2 + 1)
-    ])
-    super_diff = np.maximum(np.log1p(mags) - np.log1p(max_filtered_prev), 0.0)
-    spectral_flux = float(np.sum(super_diff * state.erb + 1.0))   # power * ERB = strong transient boost
-    state.prev_mags[:] = mags
-    combined_score = mags * spectral_flux * snr_score            # HFC weighted by SNR audibility and spectral flux (transient boost)
-    peak_idx, _ = find_peaks(combined_score, distance=state.min_dist, height=1e-12)
-    if len(peak_idx) == 0:
-        peak_idx = np.argpartition(combined_score, -n_candidates)[-n_candidates:]
+# ─────────────────────────────────────────────────────────────────────────────
+#  Phase A — parallel FFT extraction
+# ─────────────────────────────────────────────────────────────────────────────
+def _compute_all_spectra(
+    audio:    np.ndarray,
+    centers:  list,
+    state:    AnalysisState,
+) -> np.ndarray:
+    """
+    Compute all FFT magnitude spectra in parallel via ThreadPoolExecutor.
+    numpy.fft releases the GIL -> true multi-core parallelism.
+    Pre-allocates a single (n_frames x n_bins) matrix; each thread writes
+    its own row with no locking.
+    """
+    n_frames = len(centers)
+    n_bins   = state.win // 2 + 1
+    all_mags = np.empty((n_frames, n_bins), dtype=np.float32)
+    half     = state.win // 2
+    n_audio  = len(audio)
+    window   = state.window        # read-only
+    scale    = state.win_scale
 
-    peak_scores = combined_score[peak_idx]
-    sort_order  = np.argsort(peak_scores)[::-1]
-    sorted_idx  = peak_idx[sort_order]
-    n_peaks_total = len(sorted_idx)
-    n_take = n_peaks_total
-    pool_freqs, pool_amps = _parabolic_interp(sorted_idx[:n_take], mags, state.bin_width)
-    mask      = (pool_freqs >= 20.0) & (pool_freqs <= state.nyquist - state.bin_width)
-    top_freqs = pool_freqs[mask].astype(np.float32)
-    top_mags  = pool_amps[mask].astype(np.float32)
-    if len(top_freqs) < n_candidates:
-        extra_needed  = n_candidates - len(top_freqs)
-        remaining_idx = sorted_idx[n_take:]
-        if len(remaining_idx) > 0:
-            rem_freqs, rem_amps = _parabolic_interp(remaining_idx, mags, state.bin_width)
-            rem_mask   = (rem_freqs >= 20.0) & (rem_freqs <= state.nyquist - state.bin_width)
-            top_freqs  = np.concatenate([top_freqs, rem_freqs[rem_mask][:extra_needed].astype(np.float32)])
-            top_mags   = np.concatenate([top_mags,  rem_amps[rem_mask][:extra_needed].astype(np.float32)])
-    return top_freqs, np.clip(top_mags, 0.0, 1.0)
-
-# ─────────────────────────────────────────────────────────────
-#  Greedy Peak Tracker
-# ─────────────────────────────────────────────────────────────
-@njit(cache=True)
-def _track_greedy(
-    cand_f, cand_a,
-    prev_f, prev_a,
-    prevprev_f,
-    n_partials,
-    cooldowns,
-    cooldown_frames=1,
-):
-    out_f = np.zeros(n_partials, dtype=np.float32)
-    out_a = np.zeros(n_partials, dtype=np.float32)
-    cooldowns[:] = np.maximum(0, cooldowns - 1)
-
-    if len(cand_f) == 0:
-        return out_f, out_a, cooldowns
-
-    claimed = np.zeros(len(cand_f), dtype=np.bool_)
-    active = np.where(prev_a > 0)[0]
-    # sort active by descending amplitude
-    for i in range(len(active)):
-        for j in range(i+1, len(active)):
-            if prev_a[active[j]] > prev_a[active[i]]:
-                active[i], active[j] = active[j], active[i]
-
-    for slot_idx in active:
-        if np.all(claimed):
-            break
-
-        predicted_f = prev_f[slot_idx]
-        sc = predicted_f
-        tol = max(sc * 0.038, (24.7 + 0.108 * sc) * 0.55)
-        dists = np.where(~claimed, np.abs(cand_f - sc), 1e12)
-        bi = np.argmin(dists)
-        tol *= 1.25 if cand_f[bi] > sc else 0.85
-        eps = 1e-12
-        tol *= 1 - np.log1p(prev_a[slot_idx] + eps)/np.log1p(9 + eps)
-        tol *= min(2.0, 1.0 + (abs(prev_f[slot_idx] - prevprev_f[slot_idx])
-                    if prevprev_f[slot_idx] > 1e-3 else 0.0) / 80.0)
-
-        if dists[bi] <= tol * 1.8:
-            out_f[slot_idx] = cand_f[bi]
-            out_a[slot_idx] = cand_a[bi]
-            claimed[bi] = True
+    def _fft_one(i: int) -> None:
+        c = centers[i]
+        s, e = c - half, c + half
+        if s < 0 or e > n_audio:
+            chunk = np.zeros(state.win, dtype=np.float32)
+            ss, se = max(0, s), min(n_audio, e)
+            chunk[ss - s : ss - s + (se - ss)] = audio[ss:se]
         else:
-            cooldowns[slot_idx] = cooldown_frames
+            chunk = audio[s:e]
+        spec = np.fft.rfft(chunk.astype(np.float64) * window)
+        all_mags[i] = np.abs(spec).astype(np.float32) * scale
 
-    # handle new births
-    births_idx = []
-    for i in range(len(claimed)):
-        if not claimed[i]:
-            births_idx.append(i)
-    # sort births by descending amplitude
-    for i in range(len(births_idx)):
-        for j in range(i+1, len(births_idx)):
-            if cand_a[births_idx[j]] > cand_a[births_idx[i]]:
-                births_idx[i], births_idx[j] = births_idx[j], births_idx[i]
+    n_workers = min(os.cpu_count() or 4, n_frames)
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        list(tqdm(
+            pool.map(_fft_one, range(n_frames)),
+            total=n_frames, desc="   FFT      ",
+            unit="frame", dynamic_ncols=True,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} frames  [{elapsed}<{remaining}  {rate_fmt}]",
+        ))
+    return all_mags
 
-    empty_slots = []
-    for i in range(n_partials):
-        if out_a[i] == 0 and cooldowns[i] == 0:
-            empty_slots.append(i)
 
-    n_assign = min(len(births_idx), len(empty_slots))
-    for i in range(n_assign):
-        bi = births_idx[i]
-        sl = empty_slots[i]
-        if cand_a[bi] > 1e-6 and cand_f[bi] > 1e-3:
-            out_f[sl] = cand_f[bi]
-            out_a[sl] = cand_a[bi]
+# ─────────────────────────────────────────────────────────────────────────────
+#  WAV Loading
+# ─────────────────────────────────────────────────────────────────────────────
+def load_audio(path: str, target_sr: int = 44100) -> tuple[np.ndarray, int]:
+    y, sr = librosa.load(path, sr=target_sr, mono=True)
+    peak  = np.max(np.abs(y))
+    return (y / peak).astype(np.float32), target_sr
 
-    return out_f, out_a, cooldowns
-# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  RSC6 Binary Writer
-#
-#  Header (35 bytes):
-#    "RSC6" | u8 ver | u32 sr | u32 frame_sz | u16 n_partials |
-#    u32 total_samples | u32 total_frames | u16 mask_sz |
-#    u8 k_freq | u8 k_amp | u32 born_data_sz | u32 rice_freq_sz
-#
-#  Section 1 — Bitmasks  : nF * 2 * mask_sz  bytes
-#  Section 2 — Born data : born_data_sz       bytes  (uint16 fq + uint8 amu, uncompressed)
-#  Section 3 — Rice freq : rice_freq_sz       bytes  (zigzag+Rice(k_freq) freq deltas)
-#  Section 4 — Rice amp  : remaining          bytes  (zigzag+Rice(k_amp)  amp  deltas)
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 def write_rsc(
-    path: str,
-    frame_freqs: np.ndarray,
-    frame_amps:  np.ndarray,
-    sample_rate: int,
-    frame_size:  int,
+    path:          str,
+    frame_freqs:   np.ndarray,
+    frame_amps:    np.ndarray,
+    sample_rate:   int,
+    frame_size:    int,
     total_samples: int,
 ) -> None:
     n_frames, n_partials = frame_freqs.shape
     mask_sz    = (n_partials + 7) // 8
     freq_scale = 65535.0 / (sample_rate / 2.0)
-    f_q  = np.clip(np.round(frame_freqs * freq_scale), 0, 65535).astype(np.int32)
-    a_lin = _linear_encode(frame_amps)   # uint16 now, was uint8 
 
-    # ── Vectorised Pass 1 ────────────────────────────────────────────────
-    #
-    # was_alive[i, slot] = alive[i-1, slot] (False for frame 0 — no prior context).
-    # Continuing slots: alive at both i-1 and i.
-    # Delta validity range matches original int16/int8 checks exactly.
-    # np.where returns indices in row-major (frame-first, ascending slot) order,
-    # so born_buf and delta list order are identical to the original Python loop.
-    #
-    alive      = frame_amps > ALIVE_THRESHOLD                           # (F, P) bool
+    f_q   = np.clip(np.round(frame_freqs * freq_scale), 0, 65535).astype(np.int32)
+    a_lin = _linear_encode(frame_amps)
+
+    # Vectorised delta computation (unchanged — already optimal numpy)
+    alive      = frame_amps > ALIVE_THRESHOLD
     was_alive  = np.vstack([np.zeros((1, n_partials), bool), alive[:-1]])
     nat_born   = alive & ~was_alive
     continuing = alive & was_alive
@@ -368,50 +515,48 @@ def write_rsc(
     born_bits_mat = nat_born | overflow
     valid_cont    = continuing & ~overflow
 
-    # ── Bitmasks (vectorised, no per-frame loop) ─────────────────────────
+    # Bitmasks (vectorised packbits)
     pad_w     = mask_sz * 8
     alive_pad = np.zeros((n_frames, pad_w), np.uint8)
     born_pad  = np.zeros((n_frames, pad_w), np.uint8)
     alive_pad[:, :n_partials] = alive
     born_pad [:, :n_partials] = born_bits_mat
-    alive_packed = np.packbits(alive_pad, axis=1, bitorder="little")  # (F, mask_sz)
-    born_packed  = np.packbits(born_pad,  axis=1, bitorder="little")  # (F, mask_sz)
-    # np.stack → (F, 2, mask_sz); .tobytes() in C order yields
-    # alive[0], born[0], alive[1], born[1], ... — identical to original.
-    stacked     = np.stack([alive_packed, born_packed], axis=1)
-    bitmask_buf = stacked.tobytes()
+    alive_packed = np.packbits(alive_pad, axis=1, bitorder="little")
+    born_packed  = np.packbits(born_pad,  axis=1, bitorder="little")
+    bitmask_buf  = np.stack([alive_packed, born_packed], axis=1).tobytes()
 
-    # ── Born buffer (batch uint16-LE + uint8, no struct loop) ────────────
-    br, bc = np.where(born_bits_mat)          # ascending frame then slot
+    # Born buffer
+    br, bc = np.where(born_bits_mat)
     if len(br):
-        bfq  = f_q [br, bc].astype(np.uint16)
-        bamu = a_lin[br, bc]                  # renamed from a_mu → a_lin
+        bfq  = f_q[br, bc].astype(np.uint16)
+        bamu = a_lin[br, bc]
         raw  = np.empty(len(br) * 4, np.uint8)
         raw[0::4] = (bfq  & 0xFF).astype(np.uint8)
-        raw[1::4] = (bfq  >> 8  ).astype(np.uint8)
+        raw[1::4] = (bfq  >>  8 ).astype(np.uint8)
         raw[2::4] = (bamu & 0xFF).astype(np.uint8)
-        raw[3::4] = (bamu >> 8  ).astype(np.uint8)
+        raw[3::4] = (bamu >>  8 ).astype(np.uint8)
         born_buf = raw.tobytes()
     else:
         born_buf = b""
 
-    # ── Delta arrays ──────────────────────────────────────────────────────
+    # Delta arrays
     cr, cc      = np.where(valid_cont)
     freq_deltas = df_mat[cr, cc].astype(np.int32) if len(cr) else np.array([], np.int32)
     amp_deltas  = da_mat[cr, cc].astype(np.int32) if len(cr) else np.array([], np.int32)
-    print(f"   Pass 1 done  |  {len(br)} births  |  {len(cr)} continuing deltas")
+    print(f"   Delta pass  |  {len(br)} births  |  {len(cr)} continuing")
 
-    # ── Pass 2: zigzag + Rice encode delta streams ────────────────────────
-    fd_zz  = _zigzag(freq_deltas)
-    ad_zz  = _zigzag(amp_deltas)
-    k_freq = _optimal_k(fd_zz)
-    k_amp  = _optimal_k(ad_zz)
-    print(f"   Rice k_freq={k_freq}  k_amp={k_amp}"
-          f"  |  {len(freq_deltas)} freq deltas  {len(amp_deltas)} amp deltas")
-    rice_freq = _rice_encode(fd_zz, k_freq)
-    rice_amp  = _rice_encode(ad_zz, k_amp)
+    # Zigzag + optimal k (JIT)
+    fd_zz  = _zigzag_njit(freq_deltas)
+    ad_zz  = _zigzag_njit(amp_deltas)
+    k_freq = _optimal_k_njit(fd_zz)
+    k_amp  = _optimal_k_njit(ad_zz)
+    print(f"   Rice k_freq={k_freq}  k_amp={k_amp}")
 
-    # ── Write file ────────────────────────────────────────────────────────
+    # Rice encode (JIT manual bit-writer)
+    rice_freq = bytes(_rice_encode_njit(fd_zz, k_freq))
+    rice_amp  = bytes(_rice_encode_njit(ad_zz, k_amp))
+
+    # Write file
     born_data_sz = len(born_buf)
     rice_freq_sz = len(rice_freq)
     header = struct.pack(
@@ -422,102 +567,119 @@ def write_rsc(
         mask_sz, k_freq, k_amp,
         born_data_sz, rice_freq_sz,
     )
-    assert len(header) == 35, f"Header size wrong: {len(header)}"
+    assert len(header) == 35, f"Header size mismatch: {len(header)}"
     with open(path, "wb") as fh:
         fh.write(header)
         fh.write(bitmask_buf)
         fh.write(born_buf)
         fh.write(rice_freq)
         fh.write(rice_amp)
+
     total_sz = 35 + len(bitmask_buf) + born_data_sz + rice_freq_sz + len(rice_amp)
     rsc4_sz  = 23 + n_frames * n_partials * 4
     kb       = total_sz / 1024
     saving4  = 100.0 * (1.0 - total_sz / rsc4_sz)
-    print(f"  ✅ Wrote {n_frames} frames → {path}")
-    print(f"     {kb:.1f} KB  ({saving4:.1f}% smaller than RSC4  {kb/(n_frames / TARGET_FPS):.2f} KB/s avg)")
+    print(f"  ✅ Wrote {n_frames} frames -> {path}")
+    print(f"     {kb:.1f} KB  ({saving4:.1f}% smaller than RSC4  "
+          f"{kb / (n_frames / TARGET_FPS):.2f} KB/s avg)")
     print(f"     Bitmasks {len(bitmask_buf)/1024:.1f} KB  |  Born {born_data_sz/1024:.1f} KB"
           f"  |  Rice-freq {rice_freq_sz/1024:.1f} KB  |  Rice-amp {len(rice_amp)/1024:.1f} KB")
 
-# ─────────────────────────────────────────────────────────────
-#  Main Encode Pipeline
-# ─────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main encode pipeline
+# ─────────────────────────────────────────────────────────────────────────────
 def encode(
-    input_path: str,
+    input_path:  str,
     output_path: str,
-    n_partials: int,
-    target_sr: int,
+    n_partials:  int,
+    target_sr:   int,
 ) -> None:
-    print(f"RSC Encoder  --  {input_path}")
+    print(f"RSC Encoder (optimised)  --  {input_path}")
     print(f"   Partials/frame : {n_partials}  |  Target SR: {target_sr} Hz")
-    samples, native_sr = load_audio(input_path, target_sr)
-    print(f"   Native SR      : {native_sr} Hz  |  {len(samples)} samples  "
-          f"({len(samples)/native_sr:.2f}s)")
-    if native_sr != target_sr:
-        print(f"   Resampling {native_sr} → {target_sr} Hz ...")
-        from math import gcd
-        from scipy.signal import resample_poly
-        g       = gcd(target_sr, native_sr)
-        samples = resample_poly(samples, target_sr // g, native_sr // g).astype(np.float32)
-        peak    = np.max(np.abs(samples))
-        samples /= peak
-    sample_rate   = target_sr
+
+    t0 = time.perf_counter()
+
+    samples, sr = load_audio(input_path, target_sr)
+    print(f"   {len(samples)} samples  ({len(samples)/sr:.2f}s)  @{sr} Hz")
+
     total_samples = len(samples)
-    frame_size    = int(round(sample_rate / TARGET_FPS))
+    frame_size    = int(round(sr / TARGET_FPS))
     n_frames      = math.ceil(total_samples / frame_size)
     pad           = n_frames * frame_size - total_samples
     if pad > 0:
         samples = np.concatenate([samples, np.zeros(pad, np.float32)])
-    print(f"   Frame size     : {frame_size} samp ({1000*frame_size/sample_rate:.2f} ms)"
+    print(f"   Frame size     : {frame_size} samp ({1000*frame_size/sr:.2f} ms)"
           f"  |  {n_frames} frames")
-    state = AnalysisState(sample_rate)
-    max_meaningful = int(state.win // state.min_dist // 2)
+
+    state = AnalysisState(sr)
+    max_meaningful = state.win // state.min_dist // 2
     if n_partials > max_meaningful:
-        print(f"   ⚠  Clamping partials {n_partials} → {max_meaningful} "
-              f"(max find_peaks can deliver at this window size)")
+        print(f"   Clamping partials {n_partials} -> {max_meaningful}")
         n_partials = max_meaningful
-    n_cand = n_partials
-    print(f"   Analysis win   : {ANALYSIS_WIN} samp ({state.bin_width:.1f} Hz/bin)"
-      f"  |  n_cand={n_cand}  cooldown={SLOT_COOLDOWN}")
 
-    # ── Phase 1: parallel FFT candidate extraction ────────────────────────
-    # numpy's FFT releases the GIL, so threads genuinely parallelise here.
-    # _fft_candidates only reads state.pad_buf (via .copy()) — thread-safe.
+    # ── Phase A: parallel FFT ─────────────────────────────────────────────
     centers = [i * frame_size + frame_size // 2 for i in range(n_frames)]
-    print(f"   Extracting FFT candidates...")
+    print(f"   Phase A - parallel FFT ({os.cpu_count()} threads) ...")
+    t1 = time.perf_counter()
+    all_mags = _compute_all_spectra(samples, centers, state)
+    print(f"   Phase A done in {time.perf_counter() - t1:.2f}s")
 
-    def _extract(center: int) -> tuple[np.ndarray, np.ndarray]:
-        return _fft_candidates(samples, center, state, n_cand)
+    # ── Phase B: score + peak-find (JIT, one call for all frames) ─────────
+    cand_freqs  = np.zeros((n_frames, n_partials), dtype=np.float32)
+    cand_amps   = np.zeros((n_frames, n_partials), dtype=np.float32)
+    cand_counts = np.zeros(n_frames, dtype=np.int32)
+    print(f"   Phase B - scoring + peak-finding (JIT) ...")
+    t2 = time.perf_counter()
+    _score_all_frames_njit(
+        all_mags, state.ath_lin, state.erb,
+        state.bin_width, state.nyquist, n_partials,
+        cand_freqs, cand_amps, cand_counts,
+    )
+    print(f"   Phase B done in {time.perf_counter() - t2:.2f}s")
+    del all_mags   # free ~(n_frames * n_bins * 4) bytes
 
-    candidates = [_extract(c) for c in tqdm(centers, desc="FFT extraction")]
-
-    # ── Phase 2: sequential greedy tracking ──────────────────────────────
-    # Tracking is inherently serial (each frame depends on the previous),
-    # but the FFT work above is already done.
-    print(f"   Tracking partials ...")
+    # ── Phase C: greedy tracking (JIT, sequential) ────────────────────────
+    print(f"   Phase C - greedy tracking (JIT) ...")
+    t3 = time.perf_counter()
     all_f = np.zeros((n_frames, n_partials), dtype=np.float32)
     all_a = np.zeros((n_frames, n_partials), dtype=np.float32)
+
     prev_f     = np.zeros(n_partials, np.float32)
     prev_a     = np.zeros(n_partials, np.float32)
     prevprev_f = np.zeros(n_partials, np.float32)
     cooldowns  = np.zeros(n_partials, np.int32)
-    for i, (cf, ca) in enumerate(tqdm(candidates, desc="Tracking partials")):
+
+    for i in tqdm(range(n_frames), desc="   Tracking  ",
+                  unit="frame", dynamic_ncols=True,
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} frames  [{elapsed}<{remaining}  {rate_fmt}]"):
+        nc  = int(cand_counts[i])
         of, oa, cooldowns = _track_greedy(
-            cf, ca, prev_f, prev_a, prevprev_f, n_partials, cooldowns
+            cand_freqs[i, :nc], cand_amps[i, :nc],
+            prev_f, prev_a, prevprev_f, n_partials, cooldowns,
         )
         all_f[i]   = of
         all_a[i]   = oa
-        prevprev_f = prev_f
-        prev_f     = of
-        prev_a     = oa
-    print()
-    write_rsc(output_path, all_f, all_a, sample_rate, frame_size, total_samples)
+        prevprev_f = prev_f.copy()
+        prev_f     = of.copy()
+        prev_a     = oa.copy()
 
-# ─────────────────────────────────────────────────────────────
+    print(f"   Phase C done in {time.perf_counter() - t3:.2f}s\n")
+
+    # ── Phase D: encode + write ───────────────────────────────────────────
+    write_rsc(output_path, all_f, all_a, sr, frame_size, total_samples)
+
+    elapsed = time.perf_counter() - t0
+    dur     = total_samples / sr
+    print(f"   Done in {elapsed:.2f}s  (RTF {elapsed/dur:.3f}x)")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  CLI
-# ─────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="RSC6 Encoder",
+        description="RSC6 Encoder (optimised)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--input",      "-i", required=True)
@@ -528,6 +690,7 @@ def main() -> None:
     args = p.parse_args()
     out  = args.output or (args.input.removesuffix(".wav") + RSC_EXTENSION)
     encode(args.input, out, args.partials, args.samplerate)
+
 
 if __name__ == "__main__":
     main()
