@@ -185,7 +185,6 @@ def _rice_encode_njit(vals: np.ndarray, k: int) -> np.ndarray:
 def _score_all_frames_njit(
     all_mags:     np.ndarray,   # float32 (n_frames, n_bins)
     ath_lin:      np.ndarray,   # float32 (n_bins,)
-    erb:          np.ndarray,   # float32 (n_bins,)
     bin_width:    np.float32,
     nyquist:      np.float32,
     n_candidates: int,
@@ -217,7 +216,7 @@ def _score_all_frames_njit(
         for b in range(n_bins):
             d = np.log1p(mags[b]) - np.log1p(prev_mags[b])
             if d > np.float32(0.0):
-                flux += d * (erb[b] + np.float32(1.0))
+                flux += d * (np.float32(1.0))
 
         # ── Per-bin combined score + update prev_mags ─────────────────────
         for b in range(n_bins):
@@ -420,7 +419,6 @@ class AnalysisState:
         self.min_dist  = 1
         n_bins         = analysis_win // 2 + 1
         freqs          = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
-        self.erb       = (21.4 * np.log10(4.37e-3 * freqs + 1)).astype(np.float32)
         self.ath_lin   = _ath_linear(n_bins, sample_rate, analysis_win)
 
 
@@ -632,7 +630,7 @@ def encode(
     print(f"   Phase B - scoring + peak-finding (JIT) ...")
     t2 = time.perf_counter()
     _score_all_frames_njit(
-        all_mags, state.ath_lin, state.erb,
+        all_mags, state.ath_lin,
         state.bin_width, state.nyquist, n_partials,
         cand_freqs, cand_amps, cand_counts,
     )
