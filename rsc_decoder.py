@@ -228,7 +228,12 @@ def _synthesize_njit(
                     s    = sin_lut[idx]
                 else:
                     s    = math.sin(phase)
-                amp     = pa + da * t_norm[t]
+                # Quintic interpolation (6t^5 - 15t^4 + 10t^3)
+                tn = t_norm[t]
+                tn2 = tn * tn
+                tn3 = tn2 * tn
+                fade = np.float32(6.0) * tn3 * tn2 - np.float32(15.0) * tn2 * tn2 + np.float32(10.0) * tn3
+                amp     = pa + da * fade
                 output[base + t] += amp * s
 
 

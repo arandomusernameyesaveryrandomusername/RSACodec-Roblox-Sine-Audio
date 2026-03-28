@@ -348,16 +348,30 @@ def _track_greedy(
 
         if best_bi < 0:
             break
+        # ERB-rate of the predicted centre frequency (Cams)
+        sc_erb  = np.float32(21.4) * np.log10(np.float32(4.37e-3) * sc + np.float32(1.0))
 
-        # Asymmetric, amplitude-scaled, velocity-scaled tolerance
-        tol = max(sc * np.float32(0.038),
-                  (np.float32(24.7) + np.float32(0.108) * sc) * np.float32(0.55))
-        tol *= np.float32(1.25) if cand_f[best_bi] > sc else np.float32(0.85)
-        eps  = np.float32(1e-12)
-        tol *= np.float32(1.0) - np.log1p(prev_a[slot] + eps) / np.log1p(np.float32(9.0) + eps)
-        ppf  = prevprev_f[slot]
-        vel  = abs(prev_f[slot] - ppf) if ppf > np.float32(1e-3) else np.float32(0.0)
-        tol *= min(np.float32(2.0), np.float32(1.0) + vel / np.float32(80.0))
+        # 1-Cam bandwidth expressed back in Hz at sc — this IS the perceptual channel width
+        one_cam_hz = (np.float32(10.0) ** ((sc_erb + np.float32(1.0)) / np.float32(21.4)) - \
+                    np.float32(10.0) ** (sc_erb / np.float32(21.4))) / np.float32(4.37e-3)
+
+        # Base tolerance: half a Cam (symmetric perceptual unit, no arbitrary Hz value)
+        tol = one_cam_hz * np.float32(0.5)
+
+        # Direction asymmetry: rising = wider (ratio of adjacent Cam boundaries, not a picked number)
+        sc_erb_up   = sc_erb + np.float32(0.5)
+        sc_erb_down = sc_erb - np.float32(0.5)
+        hz_up   = (np.float32(10.0) ** (sc_erb_up   / np.float32(21.4)) - np.float32(1.0)) / np.float32(4.37e-3)
+        hz_down = (np.float32(10.0) ** (sc_erb_down / np.float32(21.4)) - np.float32(1.0)) / np.float32(4.37e-3)
+        asym    = (hz_up - sc) / (sc - hz_down)   # >1 above sc, <1 below — derived from ERB curvature
+        tol    *= asym if cand_f[best_bi] > sc else (np.float32(1.0) / asym)
+
+        # Amplitude weighting: log1p is its own scale — ratio of log1p(prev_a) to log1p(1.0) (unit amplitude)
+        tol    *= np.float32(1.0) - np.log1p(prev_a[slot]) / np.log1p(np.float32(1.0))
+
+        # Velocity: express drift as fraction of one_cam_hz per frame — no Hz/frame magic number
+        vel  = abs(prev_f[slot] - prevprev_f[slot]) if prevprev_f[slot] > np.finfo(np.float32).eps else np.float32(0.0)
+        tol *= np.float32(1.0) + vel / one_cam_hz
 
         if best_d <= tol * np.float32(1.8):
             out_f[slot]      = cand_f[best_bi]
@@ -419,6 +433,7 @@ class AnalysisState:
         self.min_dist  = 1
         n_bins         = analysis_win // 2 + 1
         freqs          = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
+        self.erb       = (21.4 * np.log10(4.37e-3 * freqs + 1)).astype(np.float32)
         self.ath_lin   = _ath_linear(n_bins, sample_rate, analysis_win)
 
 
