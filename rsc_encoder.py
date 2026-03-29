@@ -217,9 +217,9 @@ def _score_all_frames_njit(
         # ── Spectral flux (scalar for this frame) ─────────────────────────
         flux = np.float32(0.0)
         for b in range(n_bins):
-            d = np.log1p(mags[b]) - np.log1p(prev_mags[b])
+            d = mags[b] - prev_mags[b]
             if d > np.float32(0.0):
-                flux += (d * (np.float32(1.0)) + 1)
+                flux += np.sqrt(d)
 
         # ── Per-bin combined score + update prev_mags ─────────────────────
         for b in range(n_bins):
