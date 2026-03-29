@@ -164,7 +164,9 @@ def _parse_frames_njit(
                 curr_amu[slot] = max(0, min(65535, v))
 
             freqs_out[i, slot] = curr_fq[slot]  * freq_scale
-            amps_out[i, slot]  = curr_amu[slot] * np.float32(1.0 / 65535.0)
+            mu = np.float32(65535.0)
+            x  = np.float32(curr_amu[slot]) / mu        # back to [0,1] linear
+            amps_out[i, slot] = (np.float32(10.0) ** (x * np.log10(mu + np.float32(1.0))) - np.float32(1.0)) / mu
 
 
 @njit(cache=True, fastmath=True)

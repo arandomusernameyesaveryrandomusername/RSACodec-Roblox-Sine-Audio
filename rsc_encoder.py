@@ -62,7 +62,7 @@ TARGET_FPS         = 60
 DEFAULT_PARTIALS   = 384
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
-ANALYSIS_WIN       = 3072
+ANALYSIS_WIN       = 2048
 SLOT_COOLDOWN      = 1
 ALIVE_THRESHOLD    = 0
 
@@ -91,9 +91,12 @@ def _ath_linear(n_bins: int, sample_rate: int, win: int,
 # ─────────────────────────────────────────────────────────────────────────────
 #  Quantisation
 # ─────────────────────────────────────────────────────────────────────────────
-def _linear_encode(x: np.ndarray) -> np.ndarray:
-    """float32 [0,1] -> uint16 [0,65535]"""
-    return np.clip(np.round(x * 65535.0), 0, 65535).astype(np.uint16)
+
+def _mu_encode(x: np.ndarray) -> np.ndarray:
+    # mu-law style: preserves quiet partials much better
+    mu = np.float32(65535.0)
+    x  = np.clip(x, 0.0, 1.0)
+    return np.clip(np.round(np.log1p(mu * x) / np.log1p(mu) * 65535.0), 0, 65535).astype(np.uint16)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,7 +219,7 @@ def _score_all_frames_njit(
         for b in range(n_bins):
             d = np.log1p(mags[b]) - np.log1p(prev_mags[b])
             if d > np.float32(0.0):
-                flux += d * (np.float32(1.0))
+                flux += (d * (np.float32(1.0)) + 1)
 
         # ── Per-bin combined score + update prev_mags ─────────────────────
         for b in range(n_bins):
@@ -348,6 +351,7 @@ def _track_greedy(
 
         if best_bi < 0:
             break
+
         # ERB-rate of the predicted centre frequency (Cams)
         sc_erb  = np.float32(21.4) * np.log10(np.float32(4.37e-3) * sc + np.float32(1.0))
 
@@ -356,7 +360,7 @@ def _track_greedy(
                     np.float32(10.0) ** (sc_erb / np.float32(21.4))) / np.float32(4.37e-3)
 
         # Base tolerance: half a Cam (symmetric perceptual unit, no arbitrary Hz value)
-        tol = one_cam_hz * np.float32(0.5)
+        tol = one_cam_hz * 0.5
 
         # Direction asymmetry: rising = wider (ratio of adjacent Cam boundaries, not a picked number)
         sc_erb_up   = sc_erb + np.float32(0.5)
@@ -426,7 +430,7 @@ class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = windows.blackman(analysis_win, 4).astype(np.float32)
+        self.window    = windows.dpss(analysis_win, 3).astype(np.float32)
         self.win_scale = np.float32(1.0 / float(np.sum(self.window)))
         self.bin_width = np.float32(float(sample_rate) / analysis_win)
         self.nyquist   = np.float32(sample_rate / 2.0)
@@ -507,7 +511,7 @@ def write_rsc(
     freq_scale = 65535.0 / (sample_rate / 2.0)
 
     f_q   = np.clip(np.round(frame_freqs * freq_scale), 0, 65535).astype(np.int32)
-    a_lin = _linear_encode(frame_amps)
+    a_lin = _mu_encode(frame_amps)
 
     # Vectorised delta computation (unchanged — already optimal numpy)
     alive      = frame_amps > ALIVE_THRESHOLD

@@ -62,7 +62,6 @@ local FRAME_RATE    = 60
 local EQ_COUNT = 12
 local EQ_SCALE = 1200.0   -- EQ_MAX_H(100) * EQ_GAIN(3.0) — precomputed
 
--- ══════════════════════════════════════════════════
 -- BIT-MASK LOOKUP  (avoids lshift inside tight loops)
 -- BIT_MASK[bitInByte+1] where bitInByte = slot % 8
 -- ══════════════════════════════════════════════════
@@ -251,7 +250,9 @@ local function decodeFrames(raw, hdr)
 				end
 
 				freqs[frameBase + slot1] = currFq [slot1] * fScale
-				amps[frameBase + slot1] = currAmu[slot1] / 65535.0
+				local mu = 65535.0
+				local x = currAmu[slot1] / mu
+				amps[frameBase + slot1] = (math.pow(mu + 1.0, x) - 1.0) / mu
 			else
 				-- Dead — reset accumulators, leave freqs/amps at 0
 				currFq [slot1] = 0
