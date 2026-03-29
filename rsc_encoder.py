@@ -194,6 +194,7 @@ def _score_all_frames_njit(
     cand_freqs:   np.ndarray,   # float32 (n_frames, n_candidates) — output
     cand_amps:    np.ndarray,   # float32 (n_frames, n_candidates) — output
     cand_counts:  np.ndarray,   # int32   (n_frames,)              — output
+    erb_bw:          np.ndarray,   # float32 (n_bins,)              — fah
 ) -> None:
     """
     For every frame:
@@ -224,7 +225,8 @@ def _score_all_frames_njit(
         # ── Per-bin combined score + update prev_mags ─────────────────────
         for b in range(n_bins):
             snr      = mags[b] / max(ath_lin[b], np.float32(1e-12))
-            score[b] = mags[b] * flux * np.log1p(snr)
+            hfc = mags[b] / erb_bw[b]     # high-frequency boost (perceptual pre-emphasis)
+            score[b] = hfc * flux * np.log1p(snr)
             prev_mags[b] = mags[b]
 
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
@@ -438,6 +440,7 @@ class AnalysisState:
         n_bins         = analysis_win // 2 + 1
         freqs          = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.erb       = (21.4 * np.log10(4.37e-3 * freqs + 1)).astype(np.float32)
+        self.erb_bw = (np.float32(24.7) * (np.float32(4.37e-3) * freqs + np.float32(1.0)))
         self.ath_lin   = _ath_linear(n_bins, sample_rate, analysis_win)
 
 
@@ -651,7 +654,7 @@ def encode(
     _score_all_frames_njit(
         all_mags, state.ath_lin,
         state.bin_width, state.nyquist, n_partials,
-        cand_freqs, cand_amps, cand_counts,
+        cand_freqs, cand_amps, cand_counts, state.erb_bw,
     )
     print(f"   Phase B done in {time.perf_counter() - t2:.2f}s")
     del all_mags   # free ~(n_frames * n_bins * 4) bytes
