@@ -11,8 +11,7 @@ Key optimisations vs. reference encoder
     • _rice_encode_njit       — manual MSB-first bit-writer (two-pass);
                                   avoids the 5 large intermediate numpy arrays
                                   of the reference; fully cache-friendly
-    • _parabolic_interp_njit  — replaces masked-array numpy version;
-                                  one allocation per call instead of ~6
+    • peak frequency computed at bin center (no parabolic interpolation)
     • _score_all_frames_njit  — fused score computation + custom local-max
                                   peak finder; replaces scipy.signal.find_peaks
                                   (~50 µs Python overhead eliminated per frame);
@@ -200,8 +199,8 @@ def _score_all_frames_njit(
     For every frame:
       1. Compute per-bin combined score (SNR-weighted, flux-boosted).
       2. Find local maxima (equivalent to scipy find_peaks with distance=1).
-      3. Sort by descending score, parabolic-interpolate, frequency-filter,
-         and write into the output candidate arrays.
+      3. Sort by descending score, frequency-filter, and write into
+         the output candidate arrays.
 
     Sequential loop maintains prev_mags across frames for spectral flux.
     Replaces n_frames individual Python/scipy calls with one JIT call.
@@ -225,8 +224,8 @@ def _score_all_frames_njit(
         # ── Per-bin combined score + update prev_mags ─────────────────────
         for b in range(n_bins):
             snr      = mags[b] / max(ath_lin[b], np.float32(1e-12))
-            hfc = mags[b] / erb_bw[b]     # high-frequency boost (perceptual pre-emphasis)
-            score[b] = hfc * flux * np.log1p(snr)
+            hfc = mags[b] * erb_bw[b]     # high-frequency boost (perceptual pre-emphasis)
+            score[b] = hfc * (flux + np.float32(1.0)) * np.log1p(snr)
             prev_mags[b] = mags[b]
 
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
@@ -244,23 +243,14 @@ def _score_all_frames_njit(
                 if ci >= n_candidates:
                     break
                 bi = top[pi]
-                if bi < 1 or bi >= n_bins - 1:
+                if bi < 0 or bi >= n_bins:
                     continue
-                alpha = np.float64(mags[bi - 1])
-                beta  = np.float64(mags[bi    ])
-                gamma = np.float64(mags[bi + 1])
-                denom = alpha - 2.0 * beta + gamma
-                if abs(denom) > 1e-12:
-                    off = 0.5 * (alpha - gamma) / denom
-                    f   = np.float32((bi + off) * bin_width)
-                    a   = np.float32(beta - 0.25 * (alpha - gamma) * off)
-                else:
-                    f = np.float32(bi * bin_width)
-                    a = mags[bi]
-                if f >= f_low and f <= f_high:
-                    cand_freqs[fi, ci] = f
-                    cand_amps[fi, ci]  = min(a, np.float32(1.0))
-                    ci += 1
+            f = np.float32(bi * bin_width)
+            a = mags[bi]
+            if f >= f_low and f <= f_high:
+                cand_freqs[fi, ci] = f
+                cand_amps[fi, ci]  = min(a, np.float32(1.0))
+                ci += 1
             cand_counts[fi] = ci
             continue
 
@@ -277,23 +267,14 @@ def _score_all_frames_njit(
         order = np.argsort(-score[peak_idx])
         sorted_peaks = peak_idx[order]
 
-        # ── Parabolic interpolation + filter → candidate slots ────────────
+        # ── Frequency-bin (no interpolation) filter → candidate slots ───
         ci = 0
         for pi in range(len(sorted_peaks)):
             if ci >= n_candidates:
                 break
             bi = sorted_peaks[pi]
-            alpha = np.float64(mags[bi - 1])
-            beta  = np.float64(mags[bi    ])
-            gamma = np.float64(mags[bi + 1])
-            denom = alpha - 2.0 * beta + gamma
-            if abs(denom) > 1e-12:
-                off = 0.5 * (alpha - gamma) / denom
-                f   = np.float32((bi + off) * bin_width)
-                a   = np.float32(beta - 0.25 * (alpha - gamma) * off)
-            else:
-                f = np.float32(bi * bin_width)
-                a = mags[bi]
+            f = np.float32(bi * bin_width)
+            a = mags[bi]
             if f >= f_low and f <= f_high:
                 cand_freqs[fi, ci] = f
                 cand_amps[fi, ci]  = min(a, np.float32(1.0))

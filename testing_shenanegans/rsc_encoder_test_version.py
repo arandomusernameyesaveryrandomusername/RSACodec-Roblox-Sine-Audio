@@ -308,29 +308,15 @@ def encode_noise_bands(
 
 
 # ─────────────────────────────────────────────────────────────
-#  Parabolic Peak Interpolation
+#  Peak frequencies at bin centers (no interpolation)
 # ─────────────────────────────────────────────────────────────
 def _parabolic_interp(
     idx_arr: np.ndarray,
     mags: np.ndarray,
     bin_width: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    idx      = idx_arr.astype(np.int32)
-    ref_bins = idx.astype(np.float64)
-    ref_mags = mags[idx].astype(np.float64)
-    valid = (idx >= 1) & (idx < len(mags) - 1)
-    if valid.any():
-        k     = idx[valid]
-        alpha = mags[k - 1].astype(np.float64)
-        beta  = mags[k    ].astype(np.float64)
-        gamma = mags[k + 1].astype(np.float64)
-        denom = alpha - 2.0 * beta + gamma
-        safe  = np.abs(denom) > 1e-12
-        offset = np.zeros(valid.sum(), dtype=np.float64)
-        offset[safe] = 0.5 * (alpha[safe] - gamma[safe]) / denom[safe]
-        ref_bins[valid] = k + offset
-        ref_mags[valid] = beta - 0.25 * (alpha - gamma) * offset
-    return ref_bins * bin_width, ref_mags
+    idx = idx_arr.astype(np.int32)
+    return idx.astype(np.float64) * bin_width, mags[idx].astype(np.float64)
 
 
 # ─────────────────────────────────────────────────────────────
