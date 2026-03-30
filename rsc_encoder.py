@@ -11,7 +11,8 @@ Key optimisations vs. reference encoder
     • _rice_encode_njit       — manual MSB-first bit-writer (two-pass);
                                   avoids the 5 large intermediate numpy arrays
                                   of the reference; fully cache-friendly
-    • peak frequency computed at bin center (no parabolic interpolation)
+    • _parabolic_interp_njit  — replaces masked-array numpy version;
+                                  one allocation per call instead of ~6
     • _score_all_frames_njit  — fused score computation + custom local-max
                                   peak finder; replaces scipy.signal.find_peaks
                                   (~50 µs Python overhead eliminated per frame);
@@ -183,7 +184,7 @@ def _rice_encode_njit(vals: np.ndarray, k: int) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 #  JIT — Score all frames + peak-find  (replaces scipy.signal.find_peaks loop)
 # ─────────────────────────────────────────────────────────────────────────────
-@njit(cache=True, fastmath=True)
+@njit(cache=True, fastmath=False)
 def _score_all_frames_njit(
     all_mags:     np.ndarray,   # float32 (n_frames, n_bins)
     ath_lin:      np.ndarray,   # float32 (n_bins,)
@@ -199,8 +200,8 @@ def _score_all_frames_njit(
     For every frame:
       1. Compute per-bin combined score (SNR-weighted, flux-boosted).
       2. Find local maxima (equivalent to scipy find_peaks with distance=1).
-      3. Sort by descending score, frequency-filter, and write into
-         the output candidate arrays.
+      3. Sort by descending score, parabolic-interpolate, frequency-filter,
+         and write into the output candidate arrays.
 
     Sequential loop maintains prev_mags across frames for spectral flux.
     Replaces n_frames individual Python/scipy calls with one JIT call.
@@ -210,48 +211,70 @@ def _score_all_frames_njit(
     score     = np.empty(n_bins, dtype=np.float32)
     f_low     = np.float32(20.0)
     f_high    = nyquist - bin_width
-
+    stability_arr = np.zeros(n_bins, dtype=np.float32)  # for future use; currently zero
     for fi in range(n_frames):
         mags = all_mags[fi]
 
-        # ── Spectral flux (scalar for this frame) ─────────────────────────
-        flux = np.float32(0.0)
+        # ── Single pass: flux + SFM + frame_max ───────────────────────
+        flux      = np.float32(0.0)
+        log_sum   = np.float32(0.0)
+        lin_sum   = np.float32(0.0)
+        frame_max = np.float32(1e-12)
         for b in range(n_bins):
             d = mags[b] - prev_mags[b]
+            stability_arr[b] = 1 / (1 + d*d)
             if d > np.float32(0.0):
                 flux += np.sqrt(d)
+            log_sum += np.log(mags[b] + np.float32(1e-12))
+            lin_sum += mags[b]
+            if mags[b] > frame_max:
+                frame_max = mags[b]
 
-        # ── Per-bin combined score + update prev_mags ─────────────────────
+        flux_norm = flux / (flux + np.float32(1.0))
+        sfm       = np.exp(log_sum / np.float32(n_bins)) / (lin_sum / np.float32(n_bins) + np.float32(1e-12))
+        sfm       = min(sfm, np.float32(1.0))
+        tonality  = np.float32(1.0) - sfm
+
+        # ── Single pass: local crest + score ──────────────────────────
+        N = np.int32(6)
         for b in range(n_bins):
+            b_lo      = max(0, b - N)
+            b_hi      = min(n_bins - 1, b + N)
+            local_sum = np.float32(0.0)
+            for k in range(b_lo, b_hi + 1):
+                local_sum += mags[k]
+            local_mean  = local_sum / np.float32(b_hi - b_lo + 1)
+            local_crest = mags[b] / (local_mean + np.float32(1e-12))
+
             snr      = mags[b] / max(ath_lin[b], np.float32(1e-12))
-            hfc = mags[b] * erb_bw[b]     # high-frequency boost (perceptual pre-emphasis)
-            score[b] = hfc * (flux + np.float32(1.0)) * np.log1p(snr)
-            prev_mags[b] = mags[b]
+            
+            rel_mag  = mags[b] / frame_max
+            temporal = np.sqrt(mags[b] * (prev_mags[b] + np.float32(1e-12)))
+            if b > 0 and b < n_bins - 1:
+                curvature = mags[b] - (mags[b-1] + mags[b+1]) * np.float32(0.5)
+                # positive = peak (concave down), negative = trough
+                t5 = max(curvature, np.float32(0.0)) / (mags[b] + np.float32(1e-12))
+            else:
+                t5 = np.float32(0.0)
+
+            t1    = np.log1p(snr * snr)
+            t2    = temporal
+            t3    = local_crest
+            t4    = tonality
+            t6 = stability_arr[b]
+            total = t1 + t2 + t3 + t4 + t5 + t6 + np.float32(1e-12)
+            score[b]      = rel_mag * (flux_norm + np.float32(1.0)) * (t1 + t2 + t3 + t4 + t5 + t6) / total
+            prev_mags[b]  = mags[b]
 
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
         n_peaks = 0
         for b in range(1, n_bins - 1):
-            if (score[b] > score[b - 1] and score[b] >= score[b + 1]
+            if (score[b] > score[b - 1] and score[b] > score[b + 1]
                     and score[b] > np.float32(1e-12)):
                 n_peaks += 1
 
         if n_peaks == 0:
-            # Fallback: take top n_candidates by raw score
-            top = np.argsort(-score)
-            ci  = 0
-            for pi in range(min(n_bins, n_candidates * 4)):
-                if ci >= n_candidates:
-                    break
-                bi = top[pi]
-                if bi < 0 or bi >= n_bins:
-                    continue
-            f = np.float32(bi * bin_width)
-            a = mags[bi]
-            if f >= f_low and f <= f_high:
-                cand_freqs[fi, ci] = f
-                cand_amps[fi, ci]  = min(a, np.float32(1.0))
-                ci += 1
-            cand_counts[fi] = ci
+            cand_counts[fi] = 0
             continue
 
         # ── Collect peak indices ──────────────────────────────────────────
@@ -267,14 +290,23 @@ def _score_all_frames_njit(
         order = np.argsort(-score[peak_idx])
         sorted_peaks = peak_idx[order]
 
-        # ── Frequency-bin (no interpolation) filter → candidate slots ───
+        # ── Parabolic interpolation + filter → candidate slots ────────────
         ci = 0
         for pi in range(len(sorted_peaks)):
             if ci >= n_candidates:
                 break
             bi = sorted_peaks[pi]
-            f = np.float32(bi * bin_width)
-            a = mags[bi]
+            alpha = np.float64(mags[bi - 1])
+            beta  = np.float64(mags[bi    ])
+            gamma = np.float64(mags[bi + 1])
+            denom = alpha - 2.0 * beta + gamma
+            if abs(denom) > 1e-12:
+                off = 0.5 * (alpha - gamma) / denom
+                f   = np.float32((bi + off) * bin_width)
+                a   = np.float32(beta - 0.25 * (alpha - gamma) * off)
+            else:
+                f = np.float32(bi * bin_width)
+                a = mags[bi]
             if f >= f_low and f <= f_high:
                 cand_freqs[fi, ci] = f
                 cand_amps[fi, ci]  = min(a, np.float32(1.0))
@@ -360,7 +392,7 @@ def _track_greedy(
         vel  = abs(prev_f[slot] - prevprev_f[slot]) if prevprev_f[slot] > np.finfo(np.float32).eps else np.float32(0.0)
         tol *= np.float32(1.0) + vel / one_cam_hz
 
-        if best_d <= tol * np.float32(1.8):
+        if best_d <= tol:
             out_f[slot]      = cand_f[best_bi]
             out_a[slot]      = cand_a[best_bi]
             claimed[best_bi] = True
