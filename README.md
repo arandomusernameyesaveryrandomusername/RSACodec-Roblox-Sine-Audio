@@ -20,11 +20,6 @@ THIS REPO CAN ONLY BE EDITED BY ME, AND ME ONLY. I have no obligation against ba
 
 Roblox Decoder is FINISHED and Open-Source :D
 
-[Download](https://github.com/arandomusernameyesaveryrandomusername/RSACodec-Roblox-Sine-Audio/raw/refs/heads/main/RSCv6.rbxl)
+[Download owo](https://github.com/arandomusernameyesaveryrandomusername/RSACodec-Roblox-Sine-Audio/raw/refs/heads/main/RSCv6.rbxl)
 
 Python Decoder IS finished and released
-
-Papers used:
-http://phenicx.upf.edu/system/files/publications/Boeck_DAFx-13.pdf
-
-http://phenicx.upf.edu/system/files/publications/Boeck_ISMIR_2013.pdf
