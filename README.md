@@ -11,7 +11,7 @@ Audio Codec 4 Roblox :P
 NOTE: for some weird reason if the audio was originally encoded using opus codec the output quality will be unpredicatble,
 
 
-This has been confirmed by testing.
+This has been confirmed by testing and I am working on a fix.
 
 
 please use mp3 or vorbis or aac if possible before encoding audio!

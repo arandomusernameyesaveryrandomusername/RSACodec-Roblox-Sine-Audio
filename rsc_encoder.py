@@ -305,7 +305,7 @@ def _score_all_frames_njit(
             dist_from_centroid = abs(b - centroid_bin) / np.float32(n_bins)
             t6 = np.float32(1.0) - dist_from_centroid  # bins near centroid score higher
 
-            score[b]      = rel_mag * (flux_norm + np.float32(1.0)) * (tonality + np.float32(1.0)) * (t1 + t2 + t3 + t4 + t5 + t6 + t7)
+            score[b]      = rel_mag * (flux_norm + np.float32(1.0)) * (t1 + t2 + t3*tonality + t4 + t5 + t6 + t7)
             prev_mags[b]  = mags[b]
 
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
