@@ -211,21 +211,16 @@ def _score_all_frames_njit(
     score     = np.empty(n_bins, dtype=np.float32)
     f_low     = np.float32(20.0)
     f_high    = nyquist - bin_width
-    stability_arr = np.zeros(n_bins, dtype=np.float32)  # for future use; currently zero
     for fi in range(n_frames):
         mags = all_mags[fi]
-
-
 
         # ── Single pass: flux + SFM + frame_max ───────────────────────
         flux      = np.float32(0.0)
         log_sum   = np.float32(0.0)
         lin_sum   = np.float32(0.0)
         frame_max = np.float32(1e-12)
-        
         for b in range(n_bins):
             d = mags[b] - prev_mags[b]
-            stability_arr[b] = 1 / (1 + d*d)
             if d > np.float32(0.0):
                 flux += np.sqrt(d)
             log_sum += np.log(mags[b] + np.float32(1e-12))
@@ -233,86 +228,42 @@ def _score_all_frames_njit(
             if mags[b] > frame_max:
                 frame_max = mags[b]
 
-        flux_norm = flux / (flux + np.float32(1.0))
         sfm       = np.exp(log_sum / np.float32(n_bins)) / (lin_sum / np.float32(n_bins) + np.float32(1e-12))
         sfm       = min(sfm, np.float32(1.0))
         tonality  = np.float32(1.0) - sfm
 
-        N = np.int32(6)
-        sliding = np.empty(n_bins, dtype=np.float32)
-        window_sum = np.float32(0.0)
-
-        # seed initial window
-        for b in range(min(N, n_bins)):
-            window_sum += mags[b]
-
-        for b in range(n_bins):
-            # add right edge
-            if b + N < n_bins:
-                window_sum += mags[b + N]
-            # remove left edge
-            if b - N - 1 >= 0:
-                window_sum -= mags[b - N - 1]
-            count = min(b + N, n_bins - 1) - max(b - N, 0) + np.int32(1)
-            sliding[b] = window_sum / np.float32(count)
-
-        sliding_min = np.empty(n_bins, dtype=np.float32)
-        sliding_max = np.empty(n_bins, dtype=np.float32)
-
-        for b in range(n_bins):
-            b_lo = max(0, b - N)
-            b_hi = min(n_bins - 1, b + N)
-            local_min = np.float32(1e12)
-            local_max = np.float32(0.0)
-            for k in range(b_lo, b_hi + 1):
-                if mags[k] < local_min:
-                    local_min = mags[k]
-                if mags[k] > local_max:
-                    local_max = mags[k]
-            sliding_min[b] = local_min
-            sliding_max[b] = local_max
-
-        # after first pass, before score loop:
-        weighted_sum = np.float32(0.0)
-        for b in range(n_bins):
-            weighted_sum += np.float32(b) * mags[b]
-        centroid_bin = int(weighted_sum / (lin_sum + np.float32(1e-12)))
-
         # ── Single pass: local crest + score ──────────────────────────
+        N = np.int32(6)
         for b in range(n_bins):
             b_lo      = max(0, b - N)
             b_hi      = min(n_bins - 1, b + N)
             local_sum = np.float32(0.0)
             for k in range(b_lo, b_hi + 1):
                 local_sum += mags[k]
-            local_crest = mags[b] / (sliding[b] + np.float32(1e-12))
-            p  = mags[b] / (sliding[b] * np.float32(2) * np.float32(N) + np.float32(1e-12))
-            t7 = p * (np.float32(1.0) - p)
+            local_mean  = local_sum / np.float32(b_hi - b_lo + 1)
+            local_crest = mags[b] / (local_mean + np.float32(1e-12))
+
             snr      = mags[b] / max(ath_lin[b], np.float32(1e-12))
+            
             rel_mag  = mags[b] / frame_max
-            temporal = np.sqrt(mags[b] * (prev_mags[b] + np.float32(1e-12)))
             if b > 0 and b < n_bins - 1:
                 curvature = mags[b] - (mags[b-1] + mags[b+1]) * np.float32(0.5)
                 # positive = peak (concave down), negative = trough
-                t4 = max(curvature, np.float32(0.0)) / (mags[b] + np.float32(1e-12))
+                t5 = max(curvature, np.float32(0.0)) / (mags[b] + np.float32(1e-12))
             else:
-                t4 = np.float32(0.0)
+                t5 = np.float32(0.0)
 
-            t1    = np.log1p(snr * snr)
-            t2    = temporal
+            t1    = np.log1p(snr)
             t3    = local_crest
-            t5 = stability_arr[b]
-            dist_from_centroid = abs(b - centroid_bin) / np.float32(n_bins)
-            t6 = np.float32(1.0) - dist_from_centroid  # bins near centroid score higher
-
-            score[b]      = rel_mag * (flux_norm + np.float32(1.0)) * (t1 + t2 + t3*tonality + t4 + t5 + t6 + t7)
+            t4    = tonality
+            score[b]      = rel_mag * (flux + np.float32(1.0)) * (t1 + t3*t4 + t5)
             prev_mags[b]  = mags[b]
 
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
         n_peaks = 0
         for b in range(1, n_bins - 1):
             if (score[b] >= score[b - 1] and score[b] >= score[b + 1]
-                and score[b] > np.float32(1e-12)):
+                    and score[b] > np.float32(1e-12)):
                 n_peaks += 1
 
         if n_peaks == 0:
@@ -417,7 +368,7 @@ def _track_greedy(
                     np.float32(10.0) ** (sc_erb / np.float32(21.4))) / np.float32(4.37e-3)
 
         # Base tolerance: half a Cam (symmetric perceptual unit, no arbitrary Hz value)
-        tol = one_cam_hz
+        tol = one_cam_hz * 0.5
 
         # Direction asymmetry: rising = wider (ratio of adjacent Cam boundaries, not a picked number)
         sc_erb_up   = sc_erb + np.float32(0.5)
@@ -427,25 +378,26 @@ def _track_greedy(
         asym    = (hz_up - sc) / (sc - hz_down)   # >1 above sc, <1 below — derived from ERB curvature
         tol    *= asym if cand_f[best_bi] > sc else (np.float32(1.0) / asym)
 
-        # Velocity: express drift as fraction of one_cam_hz per frame — no Hz/frame magic number
-        # predict where the partial WILL be this frame
-        vel       = prev_f[slot] - prevprev_f[slot] if prevprev_f[slot] > np.finfo(np.float32).eps else np.float32(0.0)
-        predicted = prev_f[slot] + vel
+        # Amplitude weighting: log1p is its own scale — ratio of log1p(prev_a) to log1p(1.0) (unit amplitude)
+        tol    *= np.float32(1.0) - np.log1p(prev_a[slot]) / np.log1p(np.float32(1.0))
 
-        # search from predicted position instead of prev
-        for ci in range(nc):
-            if not claimed[ci]:
-                d = cand_f[ci] - predicted
-                if d < np.float32(0.0):
-                    d = -d
-                if d < best_d:
-                    best_d  = d
-                    best_bi = ci
-
-        # tolerance relative to prediction error scale
-        tol  = one_cam_hz
-        tol *= asym if cand_f[best_bi] > predicted else (np.float32(1.0) / asym)
-        tol *= np.float32(1.0) + abs(vel) / one_cam_hz
+        # Velocity prediction with error-based tolerance adjustment
+        # Predict where partial should be based on velocity trend
+        vel_signed = prev_f[slot] - prevprev_f[slot] if prevprev_f[slot] > np.finfo(np.float32).eps else np.float32(0.0)
+        predicted_f = prev_f[slot] + vel_signed
+        vel_magnitude = abs(vel_signed)
+        
+        # Adjust tolerance smoothly based on prediction error
+        if best_bi >= 0:
+            pred_error = abs(cand_f[best_bi] - predicted_f)
+            # Normalize error by velocity magnitude to get dimensionless ratio
+            error_ratio = pred_error / (vel_magnitude + np.float32(1e-6))
+            # Smooth exponential curve: 0.6 (tight) at ratio=0, asymptotes to 2.0 (loose) as ratio increases
+            tol_mult = np.float32(0.6) + (np.float32(2.0) - np.float32(0.6)) * (np.float32(1.0) - np.exp(-error_ratio))
+            tol *= tol_mult
+        else:
+            # No candidate yet, use standard velocity scaling
+            tol *= np.float32(1.0) + vel_magnitude / one_cam_hz
 
         if best_d <= tol:
             out_f[slot]      = cand_f[best_bi]
@@ -726,8 +678,6 @@ def encode(
     )
     print(f"   Phase B done in {time.perf_counter() - t2:.2f}s")
     del all_mags   # free ~(n_frames * n_bins * 4) bytes
-
-    
 
     # ── Phase C: greedy tracking (JIT, sequential) ────────────────────────
     print(f"   Phase C - greedy tracking (JIT) ...")
