@@ -13,6 +13,9 @@ NOTE: for some weird reason if the audio was originally encoded using opus codec
 
 This has been confirmed by testing and I am working on a fix.
 
+FIX PROGRESS: 79%
+Doin soem testing witth the new method
+
 
 please use mp3 or vorbis or aac if possible before encoding audio!
 
