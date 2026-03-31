@@ -492,75 +492,6 @@ def _track_greedy(
 
     return out_f, out_a, cooldowns
 
-@njit(cache=True, fastmath=True)
-def _validate_candidates_njit(
-    cand_freqs:  np.ndarray,   # float32 (n_frames, n_candidates)
-    cand_amps:   np.ndarray,   # float32 (n_frames, n_candidates)
-    cand_counts: np.ndarray,   # int32   (n_frames,)
-    erb:         np.ndarray,   # float32 (n_bins,) — ERB rate lookup
-    bin_width:   np.float32,
-    nyquist:     np.float32,
-    n_partials:  int,
-    out_freqs:   np.ndarray,   # float32 (n_frames, n_candidates) — output
-    out_amps:    np.ndarray,   # float32 (n_frames, n_candidates) — output
-    out_counts:  np.ndarray,   # int32   (n_frames,)              — output
-) -> None:
-    n_frames = cand_freqs.shape[0]
-
-    for fi in range(n_frames):
-        nc_cur  = int(cand_counts[fi])
-        nc_next = int(cand_counts[fi + 1]) if fi + 1 < n_frames else 0
-
-        ci_out = 0
-        for ci in range(nc_cur):
-            f_cur = cand_freqs[fi, ci]
-            a_cur = cand_amps[fi, ci]
-
-            # ERB tolerance at this frequency — same as tracker uses
-            erb_bin    = int(f_cur / bin_width + np.float32(0.5))
-            erb_bin    = max(0, min(erb_bin, len(erb) - 1))
-            sc_erb     = erb[erb_bin]
-            one_cam_hz = (np.float32(10.0) ** ((sc_erb + np.float32(1.0)) / np.float32(21.4)) - \
-                          np.float32(10.0) ** (sc_erb / np.float32(21.4))) / np.float32(4.37e-3)
-            tol = one_cam_hz  # 1 full Cam — same as tracker base tol
-
-            # last frame — carry through unvalidated since no next frame to check
-            if fi == n_frames - 1:
-                out_freqs[fi, ci_out] = f_cur
-                out_amps[fi, ci_out]  = a_cur
-                ci_out += 1
-                continue
-
-            # search next frame for confirming candidate within ERB tolerance
-            best_d  = np.float32(1e12)
-            best_nj = -1
-            for nj in range(nc_next):
-                d = cand_freqs[fi + 1, nj] - f_cur
-                if d < np.float32(0.0):
-                    d = -d
-                if d < best_d:
-                    best_d  = d
-                    best_nj = nj
-
-            if best_d <= tol:
-                # confirmed — average both frames
-                f_next = cand_freqs[fi + 1, best_nj]
-                a_next = cand_amps[fi + 1, best_nj]
-                out_freqs[fi, ci_out] = (f_cur + f_next) * np.float32(0.5)
-                out_amps[fi, ci_out]  = (a_cur + a_next) * np.float32(0.5)
-                ci_out += 1
-            else:
-                # unconfirmed — keep but attenuate amplitude by how far it missed
-                # miss_ratio in [0,1]: 0 = just outside tol, 1 = completely unrelated
-                miss_ratio = min(best_d / (tol + np.float32(1e-12)), np.float32(1.0))
-                confidence = np.float32(1.0) - miss_ratio
-                if confidence > np.float32(0.0):
-                    out_freqs[fi, ci_out] = f_cur
-                    out_amps[fi, ci_out]  = a_cur * confidence
-                    ci_out += 1
-
-        out_counts[fi] = ci_out
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Analysis state  (pre-computed constants, shared read-only across threads)
@@ -796,25 +727,7 @@ def encode(
     print(f"   Phase B done in {time.perf_counter() - t2:.2f}s")
     del all_mags   # free ~(n_frames * n_bins * 4) bytes
 
-    # ── Phase B.5: cross-frame candidate validation ────────────────────────
-    print(f"   Phase B.5 - cross-frame validation ...")
-    t25 = time.perf_counter()
-
-    validated_freqs  = np.zeros((n_frames, n_partials), dtype=np.float32)
-    validated_amps   = np.zeros((n_frames, n_partials), dtype=np.float32)
-    validated_counts = np.zeros(n_frames, dtype=np.int32)
-
-    _validate_candidates_njit(
-        cand_freqs, cand_amps, cand_counts,
-        state.erb, state.bin_width, state.nyquist,
-        n_partials, validated_freqs, validated_amps, validated_counts,
-    )
-    print(f"   Phase B.5 done in {time.perf_counter() - t25:.2f}s")
-
-    # replace cand arrays with validated ones for Phase C
-    cand_freqs  = validated_freqs
-    cand_amps   = validated_amps
-    cand_counts = validated_counts
+    
 
     # ── Phase C: greedy tracking (JIT, sequential) ────────────────────────
     print(f"   Phase C - greedy tracking (JIT) ...")
