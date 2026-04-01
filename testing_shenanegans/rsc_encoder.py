@@ -184,7 +184,7 @@ def _rice_encode_njit(vals: np.ndarray, k: int) -> np.ndarray:
 # ─────────────────────────────────────────────────────────────────────────────
 #  JIT — Score all frames + peak-find  (replaces scipy.signal.find_peaks loop)
 # ─────────────────────────────────────────────────────────────────────────────
-@njit(cache=True, fastmath=False)
+@njit(cache=True, fastmath=True)
 def _score_all_frames_njit(
     all_mags:     np.ndarray,   # float32 (n_frames, n_bins)
     ath_lin:      np.ndarray,   # float32 (n_bins,)
@@ -194,7 +194,6 @@ def _score_all_frames_njit(
     cand_freqs:   np.ndarray,   # float32 (n_frames, n_candidates) — output
     cand_amps:    np.ndarray,   # float32 (n_frames, n_candidates) — output
     cand_counts:  np.ndarray,   # int32   (n_frames,)              — output
-    erb_bw:          np.ndarray,   # float32 (n_bins,)              — fah
 ) -> None:
     """
     For every frame:
@@ -211,69 +210,56 @@ def _score_all_frames_njit(
     score     = np.empty(n_bins, dtype=np.float32)
     f_low     = np.float32(20.0)
     f_high    = nyquist - bin_width
-    stability_arr = np.zeros(n_bins, dtype=np.float32)  # for future use; currently zero
+
     for fi in range(n_frames):
         mags = all_mags[fi]
 
-        # ── Single pass: flux + SFM + frame_max ───────────────────────
-        flux      = np.float32(0.0)
-        log_sum   = np.float32(0.0)
-        lin_sum   = np.float32(0.0)
-        frame_max = np.float32(1e-12)
+        # ── Spectral flux (scalar for this frame) ─────────────────────────
+        flux = np.float32(0.0)
         for b in range(n_bins):
-            d = mags[b] - prev_mags[b]
-            stability_arr[b] = 1 / (1 + d*d)
+            d = np.log1p(mags[b]) - np.log1p(prev_mags[b])
             if d > np.float32(0.0):
-                flux += np.sqrt(d)
-            log_sum += np.log(mags[b] + np.float32(1e-12))
-            lin_sum += mags[b]
-            if mags[b] > frame_max:
-                frame_max = mags[b]
+                flux += (d * (np.float32(1.0)) + 1)
 
-        flux_norm = flux / (flux + np.float32(1.0))
-        sfm       = np.exp(log_sum / np.float32(n_bins)) / (lin_sum / np.float32(n_bins) + np.float32(1e-12))
-        sfm       = min(sfm, np.float32(1.0))
-        tonality  = np.float32(1.0) - sfm
-
-        # ── Single pass: local crest + score ──────────────────────────
-        N = np.int32(6)
+        # ── Per-bin combined score + update prev_mags ─────────────────────
         for b in range(n_bins):
-            b_lo      = max(0, b - N)
-            b_hi      = min(n_bins - 1, b + N)
-            local_sum = np.float32(0.0)
-            for k in range(b_lo, b_hi + 1):
-                local_sum += mags[k]
-            local_mean  = local_sum / np.float32(b_hi - b_lo + 1)
-            local_crest = mags[b] / (local_mean + np.float32(1e-12))
-
             snr      = mags[b] / max(ath_lin[b], np.float32(1e-12))
-            
-            rel_mag  = mags[b] / frame_max
-            temporal = np.sqrt(mags[b] * (prev_mags[b] + np.float32(1e-12)))
-            if b > 0 and b < n_bins - 1:
-                curvature = mags[b] - (mags[b-1] + mags[b+1]) * np.float32(0.5)
-                # positive = peak (concave down), negative = trough
-                t5 = max(curvature, np.float32(0.0)) / (mags[b] + np.float32(1e-12))
-            else:
-                t5 = np.float32(0.0)
-
-            t1    = np.log1p(snr * snr)
-            t2    = temporal
-            t3    = local_crest
-            t4    = tonality
-            t6 = stability_arr[b]
-            score[b]      = rel_mag * (flux_norm + np.float32(1.0)) * (t1 + t2 + t3*tonality + t4 + t5 + t6)
-            prev_mags[b]  = mags[b]
+            score[b] = mags[b] * flux * np.log1p(snr)
+            prev_mags[b] = mags[b]
 
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
         n_peaks = 0
         for b in range(1, n_bins - 1):
-            if (score[b] > score[b - 1] and score[b] > score[b + 1]
+            if (score[b] > score[b - 1] and score[b] >= score[b + 1]
                     and score[b] > np.float32(1e-12)):
                 n_peaks += 1
 
         if n_peaks == 0:
-            cand_counts[fi] = 0
+            # Fallback: take top n_candidates by raw score
+            top = np.argsort(-score)
+            ci  = 0
+            for pi in range(min(n_bins, n_candidates * 4)):
+                if ci >= n_candidates:
+                    break
+                bi = top[pi]
+                if bi < 1 or bi >= n_bins - 1:
+                    continue
+                alpha = np.float64(mags[bi - 1])
+                beta  = np.float64(mags[bi    ])
+                gamma = np.float64(mags[bi + 1])
+                denom = alpha - 2.0 * beta + gamma
+                if abs(denom) > 1e-12:
+                    off = 0.5 * (alpha - gamma) / denom
+                    f   = np.float32((bi + off) * bin_width)
+                    a   = np.float32(beta - 0.25 * (alpha - gamma) * off)
+                else:
+                    f = np.float32(bi * bin_width)
+                    a = mags[bi]
+                if f >= f_low and f <= f_high:
+                    cand_freqs[fi, ci] = f
+                    cand_amps[fi, ci]  = min(a, np.float32(1.0))
+                    ci += 1
+            cand_counts[fi] = ci
             continue
 
         # ── Collect peak indices ──────────────────────────────────────────
@@ -391,7 +377,7 @@ def _track_greedy(
         vel  = abs(prev_f[slot] - prevprev_f[slot]) if prevprev_f[slot] > np.finfo(np.float32).eps else np.float32(0.0)
         tol *= np.float32(1.0) + vel / one_cam_hz
 
-        if best_d <= tol:
+        if best_d <= tol * np.float32(1.8):
             out_f[slot]      = cand_f[best_bi]
             out_a[slot]      = cand_a[best_bi]
             claimed[best_bi] = True
@@ -452,7 +438,6 @@ class AnalysisState:
         n_bins         = analysis_win // 2 + 1
         freqs          = np.fft.rfftfreq(analysis_win, d=1.0 / sample_rate).astype(np.float32)
         self.erb       = (21.4 * np.log10(4.37e-3 * freqs + 1)).astype(np.float32)
-        self.erb_bw = (np.float32(24.7) * (np.float32(4.37e-3) * freqs + np.float32(1.0)))
         self.ath_lin   = _ath_linear(n_bins, sample_rate, analysis_win)
 
 
@@ -666,7 +651,7 @@ def encode(
     _score_all_frames_njit(
         all_mags, state.ath_lin,
         state.bin_width, state.nyquist, n_partials,
-        cand_freqs, cand_amps, cand_counts, state.erb_bw,
+        cand_freqs, cand_amps, cand_counts,
     )
     print(f"   Phase B done in {time.perf_counter() - t2:.2f}s")
     del all_mags   # free ~(n_frames * n_bins * 4) bytes

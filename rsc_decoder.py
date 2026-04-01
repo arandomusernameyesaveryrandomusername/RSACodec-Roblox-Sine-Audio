@@ -229,7 +229,7 @@ def _synthesize_njit(
                     idx  = int(phase * lut_scale) & (len(sin_lut) - 1)
                     s    = sin_lut[idx]
                 else:
-                    s    = math.sin(phase)
+                    s    = np.sin(phase)
                 # cubic bivaer interpolation
                 tn = t_norm[t]
                 tn2 = tn * tn

@@ -222,7 +222,7 @@ def _score_all_frames_njit(
         for b in range(n_bins):
             d = mags[b] - prev_mags[b]
             if d > np.float32(0.0):
-                flux += np.sqrt(d)
+                flux += np.log1p(d)
             log_sum += np.log(mags[b] + np.float32(1e-12))
             lin_sum += mags[b]
             if mags[b] > frame_max:
@@ -253,11 +253,17 @@ def _score_all_frames_njit(
             else:
                 t5 = np.float32(0.0)
 
+            d = mags[b] - prev_mags[b]
+            local_flux = np.log1p(d)
+
+
             t1    = np.log1p(snr)
             t3    = local_crest
             t4    = tonality
+            t6    = local_flux
 
-            score[b]      = rel_mag * (flux + np.float32(1.0)) * (t1 + t3*t4 + t5)
+
+            score[b]      = rel_mag * (flux + np.float32(1.0)) * t4 * (t1 + t3 + t5 + t6)
             prev_mags[b]  = mags[b]
 
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
