@@ -233,7 +233,7 @@ def _score_all_frames_njit(
         tonality  = np.float32(1.0) - sfm
 
         # ── Single pass: local crest + score ──────────────────────────
-        N = np.int32(6)
+        N = np.int32(3)
         for b in range(n_bins):
             b_lo      = max(0, b - N)
             b_hi      = min(n_bins - 1, b + N)
@@ -256,6 +256,7 @@ def _score_all_frames_njit(
             t1    = np.log1p(snr)
             t3    = local_crest
             t4    = tonality
+
             score[b]      = rel_mag * (flux + np.float32(1.0)) * (t1 + t3*t4 + t5)
             prev_mags[b]  = mags[b]
 
@@ -452,7 +453,7 @@ class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = windows.dpss(analysis_win, 3).astype(np.float32)
+        self.window    = windows.dpss(analysis_win, 2).astype(np.float32)
         self.win_scale = np.float32(1.0 / float(np.sum(self.window)))
         self.bin_width = np.float32(float(sample_rate) / analysis_win)
         self.nyquist   = np.float32(sample_rate / 2.0)
