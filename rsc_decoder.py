@@ -199,7 +199,9 @@ def _build_phi_track_njit(
 def _synthesize_njit(
     f_use:      np.ndarray,   # float32 (F, P)
     a32:        np.ndarray,   # float32 (F, P)
+    prev_prev_a: np.ndarray,   # float32 (F, P)
     prev_a:     np.ndarray,   # float32 (F, P)
+    a_next:     np.ndarray,   # float32 (F, P)
     phi_track:  np.ndarray,   # float32 (F, P)
     active:     np.ndarray,   # bool    (F, P)
     t_sec:      np.ndarray,   # float32 (T,)
@@ -230,11 +232,23 @@ def _synthesize_njit(
                     s    = sin_lut[idx]
                 else:
                     s    = np.sin(phase)
-                # cubic bivaer interpolation
+                # cubic-hermite interpolation
                 tn = t_norm[t]
+                p0 = prev_prev_a[i, p]
+                p1 = pa
+                p2 = ca
+                p3 = a_next[i, p]
+                m1 = (p2 - p0) * np.float32(0.5)
+                m2 = (p3 - p1) * np.float32(0.5)
                 tn2 = tn * tn
-                fade = 3*tn2 - 2*tn2*tn
-                amp = pa + da * fade
+                tn3 = tn2 * tn
+                h00 = np.float32(2.0)*tn3 - np.float32(3.0)*tn2 + np.float32(1.0)
+                h10 = tn3 - np.float32(2.0)*tn2 + tn
+                h01 = np.float32(-2.0)*tn3 + np.float32(3.0)*tn2
+                h11 = tn3 - tn2
+                amp = h00*p1 + h10*m1 + h01*p2 + h11*m2
+                amp = max(amp, np.float32(0.0))  # clamp — spline can go negative on sharp changes
+                amp = min(amp, np.float32(1.0))
                 output[base + t] += s * amp
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,9 +383,18 @@ def synthesize(
     sin_lut   = _SIN_LUT   if use_lut else np.empty(0, dtype=np.float32)
     lut_scale = _LUT_SCALE if use_lut else np.float32(0.0)
 
+    prev_prev_a       = np.empty_like(a32)
+    prev_prev_a[0]    = np.float32(0.0)
+    prev_prev_a[1]    = np.float32(0.0)
+    prev_prev_a[2:]   = a32[:-2]
+
+    a_next            = np.empty_like(a32)
+    a_next[:-1]       = np.where(a32[1:] > np.float32(0.0), a32[1:], np.float32(0.0))
+    a_next[-1]        = np.float32(0.0)
+
     print("   🎵 Synthesis (parallel JIT)…")
     _synthesize_njit(
-        f_use, a32, prev_a, phi_track, active,
+        f_use, a32, prev_prev_a, prev_a, a_next, phi_track, active,
         t_sec, t_norm, output, T,
         sin_lut, lut_scale, use_lut,
     )

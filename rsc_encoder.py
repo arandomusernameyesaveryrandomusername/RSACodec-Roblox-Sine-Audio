@@ -214,15 +214,11 @@ def _score_all_frames_njit(
     for fi in range(n_frames):
         mags = all_mags[fi]
 
-        # ── Single pass: flux + SFM + frame_max ───────────────────────
-        flux      = np.float32(0.0)
+        # ── Single pass: frame_max ───────────────────────
+        frame_max = np.float32(1e-12)
         log_sum   = np.float32(0.0)
         lin_sum   = np.float32(0.0)
-        frame_max = np.float32(1e-12)
         for b in range(n_bins):
-            d = mags[b] - prev_mags[b]
-            if d > np.float32(0.0):
-                flux += np.log1p(d)
             log_sum += np.log(mags[b] + np.float32(1e-12))
             lin_sum += mags[b]
             if mags[b] > frame_max:
@@ -230,10 +226,11 @@ def _score_all_frames_njit(
 
         sfm       = np.exp(log_sum / np.float32(n_bins)) / (lin_sum / np.float32(n_bins) + np.float32(1e-12))
         sfm       = min(sfm, np.float32(1.0))
-        tonality  = np.float32(1.0) - sfm
+
+            
 
         # ── Single pass: local crest + score ──────────────────────────
-        N = np.int32(3)
+        N = int(1.0 / (1.0 - sfm + 1e-12) + 1)   # dynamic local window size based on tonality
         for b in range(n_bins):
             b_lo      = max(0, b - N)
             b_hi      = min(n_bins - 1, b + N)
@@ -243,7 +240,7 @@ def _score_all_frames_njit(
             local_mean  = local_sum / np.float32(b_hi - b_lo + 1)
             local_crest = mags[b] / (local_mean + np.float32(1e-12))
 
-            snr      = mags[b] / max(ath_lin[b], np.float32(1e-12))
+            snr      = mags[b] / ath_lin[b]
             
             rel_mag  = mags[b] / frame_max
             if b > 0 and b < n_bins - 1:
@@ -253,18 +250,14 @@ def _score_all_frames_njit(
             else:
                 t5 = np.float32(0.0)
 
-            d = mags[b] - prev_mags[b]
-            local_flux = np.log1p(d)
-
-
             t1    = np.log1p(snr)
             t3    = local_crest
-            t4    = tonality
-            t6    = local_flux
 
+            score[b] =  rel_mag * (t1 + t3 + t5)
 
-            score[b]      = rel_mag * (flux + np.float32(1.0)) * t4 * (t1 + t3 + t5 + t6)
-            prev_mags[b]  = mags[b]
+        for b in range(n_bins):
+            prev_mags[b] = mags[b]
+
 
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
         n_peaks = 0
