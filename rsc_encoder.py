@@ -229,17 +229,18 @@ def _score_all_frames_njit(
         tonallity = 1 - sfm
 
         # ── Single pass: local crest + score ──────────────────────────
-        
         for b in range(n_bins):
-            N = int((1/sfm+1e-6) + 2)
+            N = 8
             b_lo      = max(0, b - N)
             b_hi      = min(n_bins - 1, b + N)
             local_sum = np.float32(0.0)
-            hole_radius = 1
+            hole_radius = 3
             for k in range(b_lo, b_hi + 1):
                 if k < (b - hole_radius) or k > (b + hole_radius):
                     local_sum += mags[k]
-            local_mean  = local_sum / np.float32(b_hi - b_lo + 1)
+            actual_hole_size = (min(b_hi, b + hole_radius) - max(b_lo, b - hole_radius) + 1)
+
+            local_mean  = local_sum / np.float32(b_hi - b_lo + 1 - actual_hole_size + 1e-12)
             log_peak = np.log(mags[b] + 1e-12)
             log_floor = np.log(local_mean + 1e-12)
             # This value will be > 0 if mags[b] is higher than the floor
@@ -249,15 +250,18 @@ def _score_all_frames_njit(
             rel_mag   = mags[b] / frame_max_mags           # perceptually normalised
 
             if b > 0 and b < n_bins - 1:
-                curvature = mags[b] - (mags[b-1] + mags[b+1]) * np.float32(0.5)
+                log_prev = np.log(mags[b-1] + 1e-12)
+                log_next = np.log(mags[b+1] + 1e-12)
+                curvature = log_peak - (log_prev + log_next) * 0.5
                 # positive = peak (concave down), negative = trough
-                t5 = max(curvature, np.float32(0.0)) / (mags[b] + np.float32(1e-12))
+                t5 = max(curvature, np.float32(0.0))
             else:
                 t5 = np.float32(0.0)
 
             t3    = local_crest
 
             score[b] = rel_mag * (t3 + t5)
+
 
         for b in range(n_bins):
             prev_mags[b] = mags[b]
@@ -480,7 +484,7 @@ class AnalysisState:
     def __init__(self, sample_rate: int, analysis_win: int = ANALYSIS_WIN):
         self.win       = analysis_win
         self.sr        = sample_rate
-        self.window    = windows.dpss(analysis_win, 2).astype(np.float32)
+        self.window    = windows.dpss(analysis_win, 3).astype(np.float32)
         self.win_scale = np.float32(1.0 / float(np.sum(self.window)))
         self.bin_width = np.float32(float(sample_rate) / analysis_win)
         self.nyquist   = np.float32(sample_rate / 2.0)

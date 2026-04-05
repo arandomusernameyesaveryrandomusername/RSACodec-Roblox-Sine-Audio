@@ -12,7 +12,7 @@
     RSC6 Format:
       Header : 35 bytes
       Section 1: nF * 2 * mask_sz bytes (alive + born bitmasks)
-      Section 2: born_data_sz bytes (uint16 fq + uint8 amu per born partial)
+      Section 2: born_data_sz bytes (uint16 fq + uint16 amu per born partial)
       Section 3: rice_freq_sz bytes (zigzag+Rice freq deltas, MSB-first)
       Section 4: remaining bytes   (zigzag+Rice amp  deltas, MSB-first)
 --]]
