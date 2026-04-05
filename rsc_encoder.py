@@ -59,7 +59,7 @@ from tqdm import tqdm
 #  Constants
 # ─────────────────────────────────────────────────────────────────────────────
 TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 192
+DEFAULT_PARTIALS   = 155
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 2048
@@ -247,7 +247,7 @@ def _score_all_frames_njit(
             local_crest = max(0.0, log_peak - log_floor)
 
             
-            rel_mag   = mags[b] / frame_max_mags           # perceptually normalised
+            rel_mag   = np.log1p(mags[b] / frame_max_mags)           # perceptually normalised
 
             if b > 0 and b < n_bins - 1:
                 log_prev = np.log(mags[b-1] + 1e-12)

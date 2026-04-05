@@ -850,19 +850,35 @@ coroutine.wrap(function()
 		local INV_DUR   = 1.0 / dur
 
 		-- ── PLAYBACK LOOP ───────────────────────────────────────────────────────
-		local function applyFrame(frameIdx)
+		local function applyFrame(frameIdx, t)
 			if frameIdx >= nF then frameIdx = nF - 1 end
-			local base = frameIdx * nP
+			local base0 = frameIdx * nP
+			local base1 = min(frameIdx + 1, nF - 1) * nP  -- clamp next frame
+
 			local vol2x = masterVol * 2.0
 
 			for slot = 1, nP do
 				local s = pool[slot]
-				local f = frameFreqs[base + slot]
-				local a = frameAmps[base + slot]
 
-				-- Directly set audio properties (no tweening)
-				s.PlaybackSpeed = f * INV_BASE_FREQ
-				s.Volume = a * vol2x
+				-- Freq: unchanged, still snaps
+				s.PlaybackSpeed = frameFreqs[base0 + slot] * INV_BASE_FREQ
+
+				-- Amp: cubic across 4 frames
+				local a0 = frameAmps[clamp(frameIdx - 1, 0, nF - 1) * nP + slot]
+				local a1 = frameAmps[base0 + slot]
+				local a2 = frameAmps[base1 + slot]
+				local a3 = frameAmps[min(frameIdx + 2, nF - 1) * nP + slot]
+
+				local t2 = t * t
+				local t3 = t2 * t
+				local amp = 0.5 * (
+					(2 * a1) +
+					(-a0 + a2) * t +
+					(2*a0 - 5*a1 + 4*a2 - a3) * t2 +
+					(-a0 + 3*a1 - 3*a2 + a3) * t3
+				)
+
+				s.Volume = clamp(amp, 0, 1) * vol2x  -- cubic can overshoot, so clamp
 			end
 		end
 
@@ -888,11 +904,14 @@ coroutine.wrap(function()
 			elapsed = elapsed + dt
 			if elapsed >= dur then elapsed = elapsed % dur end
 
-			local frameIdx = floor(elapsed * FRAME_RATE)
+			local exactFrame = elapsed * FRAME_RATE
+			local frameIdx   = floor(exactFrame)
+			local t          = exactFrame - frameIdx  -- fractional 0→1
+			applyFrame(frameIdx, t)
+
 
 			-- 3. Apply frame when it changes
 			if frameIdx ~= lastFrame then
-				applyFrame(frameIdx)
 				lastFrame = frameIdx
 
 				-- Update EQ targets from current frame
