@@ -907,6 +907,7 @@ coroutine.wrap(function()
 			local exactFrame = elapsed * FRAME_RATE
 			local frameIdx   = floor(exactFrame)
 			local t          = exactFrame - frameIdx  -- fractional 0→1
+			clamp(t, 0, 1)
 			applyFrame(frameIdx, t)
 
 

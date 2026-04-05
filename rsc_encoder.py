@@ -59,7 +59,7 @@ from tqdm import tqdm
 #  Constants
 # ─────────────────────────────────────────────────────────────────────────────
 TARGET_FPS         = 60
-DEFAULT_PARTIALS   = 155
+DEFAULT_PARTIALS   = 192
 DEFAULT_SAMPLERATE = 44100
 RSC_EXTENSION      = ".rsc"
 ANALYSIS_WIN       = 2048
