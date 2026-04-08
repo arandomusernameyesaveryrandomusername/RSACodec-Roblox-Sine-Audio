@@ -260,7 +260,7 @@ def _score_all_frames_njit(
 
             t3    = local_crest
 
-            score[b] = rel_mag * (t3 + t5)
+            score[b] = mags[b] * (t3 + t5)
 
 
         for b in range(n_bins):
@@ -270,8 +270,7 @@ def _score_all_frames_njit(
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
         n_peaks = 0
         for b in range(1, n_bins - 1):
-            if (score[b] > score[b - 1] and score[b] > score[b + 1]
-                    and score[b] > np.float32(1e-12)):
+            if (score[b] > np.float32(1e-12)):
                 n_peaks += 1
 
         if n_peaks == 0:
@@ -282,8 +281,7 @@ def _score_all_frames_njit(
         peak_idx = np.empty(n_peaks, dtype=np.int32)
         j = 0
         for b in range(1, n_bins - 1):
-            if (score[b] > score[b - 1] and score[b] > score[b + 1]
-                    and score[b] > np.float32(1e-12)):
+            if (score[b] > np.float32(1e-12)):
                 peak_idx[j] = b
                 j += 1
 
@@ -291,53 +289,22 @@ def _score_all_frames_njit(
         order = np.argsort(-score[peak_idx])
         sorted_peaks = peak_idx[order]
 
-        # ── Gaussian fit interpolation + filter → candidate slots ────────────
+        # ── Simple peak selection (no Gaussian interpolation) ────────────
         ci = 0
         for pi in range(len(sorted_peaks)):
             if ci >= n_candidates:
                 break
-            bi = sorted_peaks[pi]
             
-            f = np.float32(bi * bin_width)
-            a = mags[bi]
-
-            if 0 < bi < n_bins - 1:
-                # Three points: left, peak, right
-                y0 = np.float64(mags[bi-1])
-                y1 = np.float64(mags[bi])
-                y2 = np.float64(mags[bi+1])
-
-                # Gaussian fit on log scale (because Gaussian in freq → parabola on log-mag)
-                # log(y) ≈ A - B*(x - mu)^2
-                if y0 > 0 and y1 > 0 and y2 > 0:
-                    l0 = np.log(y0)
-                    l1 = np.log(y1)
-                    l2 = np.log(y2)
-
-                    # Solve for offset (mu)
-                    denom = l0 - 2.0*l1 + l2
-                    if abs(denom) > 1e-14:
-                        offset = 0.5 * (l0 - l2) / denom
-
-                        f = np.float32((bi + offset) * bin_width)
-
-                        # Reconstruct amplitude from Gaussian model
-                        # a = y1 * exp( - (offset**2) / (2*sigma^2) ) but we approximate directly
-                        sigma = np.sqrt(-1.0/denom)
-                        a = np.float32(y1 * np.exp(-offset**2 / 2*sigma**2))  # rough sigma tuning for DPSS-like lobe
-                    else:
-                        a = mags[bi]
-                else:
-                    a = mags[bi]
-            else:
-                a = mags[bi]
-
+            bi = sorted_peaks[pi]          # bin index
+            f = np.float32(bi * bin_width) # just the bin center frequency
+            a = mags[bi]                   # raw magnitude at the peak bin
+            
+            # Only take candidates inside the frequency band and above noise floor
             if f >= f_low and f <= f_high and a > np.float32(1e-8):
                 cand_freqs[fi, ci] = f
-                cand_amps[fi, ci]  = min(a, np.float32(1.0))
+                cand_amps[fi, ci] = min(a, np.float32(1.0))
                 ci += 1
-
-        cand_counts[fi] = ci
+                cand_counts[fi] = ci
 
 
 # ─────────────────────────────────────────────────────────────────────────────
