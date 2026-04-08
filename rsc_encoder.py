@@ -270,7 +270,8 @@ def _score_all_frames_njit(
         # ── Find local maxima (find_peaks distance=1) ─────────────────────
         n_peaks = 0
         for b in range(1, n_bins - 1):
-            if (score[b] > np.float32(1e-12)):
+            if (score[b] > score[b - 1] and score[b] > score[b + 1]
+                    and score[b] > np.float32(1e-12)):
                 n_peaks += 1
 
         if n_peaks == 0:
@@ -281,7 +282,8 @@ def _score_all_frames_njit(
         peak_idx = np.empty(n_peaks, dtype=np.int32)
         j = 0
         for b in range(1, n_bins - 1):
-            if (score[b] > np.float32(1e-12)):
+            if (score[b] > score[b - 1] and score[b] > score[b + 1]
+                    and score[b] > np.float32(1e-12)):
                 peak_idx[j] = b
                 j += 1
 
