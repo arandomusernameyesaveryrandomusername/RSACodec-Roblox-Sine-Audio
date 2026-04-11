@@ -246,9 +246,6 @@ def _score_all_frames_njit(
             # This value will be > 0 if mags[b] is higher than the floor
             local_crest = max(0.0, log_peak - log_floor)
 
-            
-            rel_mag   = np.log1p(mags[b] / frame_max_mags)           # perceptually normalised
-
             if b > 0 and b < n_bins - 1:
                 log_prev = np.log(mags[b-1] + 1e-12)
                 log_next = np.log(mags[b+1] + 1e-12)
@@ -260,7 +257,7 @@ def _score_all_frames_njit(
 
             t3    = local_crest
 
-            score[b] = mags[b] * (t3 + t5)
+            score[b] = (np.log1p(mags[b]) + t3 + t5)
 
 
         for b in range(n_bins):
@@ -306,7 +303,7 @@ def _score_all_frames_njit(
                 cand_freqs[fi, ci] = f
                 cand_amps[fi, ci] = min(a, np.float32(1.0))
                 ci += 1
-                cand_counts[fi] = ci
+        cand_counts[fi] = ci
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,7 +366,7 @@ def _track_greedy(
                     np.float32(10.0) ** (sc_erb / np.float32(21.4))) / np.float32(4.37e-3)
 
         # Base tolerance: half a Cam (symmetric perceptual unit, no arbitrary Hz value)
-        tol = one_cam_hz * 0.5
+        tol = one_cam_hz
 
         # Direction asymmetry: rising = wider (ratio of adjacent Cam boundaries, not a picked number)
         sc_erb_up   = sc_erb + np.float32(0.5)
@@ -385,20 +382,11 @@ def _track_greedy(
         # Velocity prediction with error-based tolerance adjustment
         # Predict where partial should be based on velocity trend
         vel_signed = prev_f[slot] - prevprev_f[slot] if prevprev_f[slot] > np.finfo(np.float32).eps else np.float32(0.0)
-        predicted_f = prev_f[slot] + vel_signed
         vel_magnitude = abs(vel_signed)
+
         
-        # Adjust tolerance smoothly based on prediction error
-        if best_bi >= 0:
-            pred_error = abs(cand_f[best_bi] - predicted_f)
-            # Normalize error by velocity magnitude to get dimensionless ratio
-            error_ratio = pred_error / (vel_magnitude + np.float32(1e-6))
-            # Smooth exponential curve: 0.6 (tight) at ratio=0, asymptotes to 2.0 (loose) as ratio increases
-            tol_mult = np.float32(0.6) + (np.float32(2.0) - np.float32(0.6)) * (np.float32(1.0) - np.exp(-error_ratio))
-            tol *= tol_mult
-        else:
-            # No candidate yet, use standard velocity scaling
-            tol *= np.float32(1.0) + vel_magnitude / one_cam_hz
+        tol *= np.float32(1.0) + vel_magnitude / one_cam_hz
+        
 
         if best_d <= tol:
             out_f[slot]      = cand_f[best_bi]

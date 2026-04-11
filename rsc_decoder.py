@@ -166,7 +166,7 @@ def _parse_frames_njit(
             freqs_out[i, slot] = curr_fq[slot]  * freq_scale
             mu = np.float32(65535.0)
             x  = np.float32(curr_amu[slot]) / mu        # back to [0,1] linear
-            amps_out[i, slot] = (np.float32(10.0) ** (x * np.log10(mu + np.float32(1.0))) - np.float32(1.0)) / mu
+            amps_out[i, slot] = (np.expm1(x * np.log1p(mu))) / mu
 
 
 @njit(cache=True, fastmath=True)
@@ -249,6 +249,7 @@ def _synthesize_njit(
                 amp = h00*p1 + h10*m1 + h01*p2 + h11*m2
                 amp = max(amp, np.float32(0.0))  # clamp — spline can go negative on sharp changes
                 amp = min(amp, np.float32(1.0))
+                # count active partials per frame
                 output[base + t] += s * amp
 
 # ─────────────────────────────────────────────────────────────────────────────
