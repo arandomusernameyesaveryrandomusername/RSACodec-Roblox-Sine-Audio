@@ -1,26 +1,16 @@
 #!/usr/bin/env python3
 """
-RSC2 Audio Codec - Encoder  (u16 amp+phase edition)
-=====================================================
-Identical scoring / partial-selection logic as before.
-Amp and phase are now stored as uint16 instead of float32:
-  amp   u16  : linear  0-65535  where 65535 = peak magnitude
-  phase u16  : 0-65535 mapping 0 → 0, 65535 → 2π  (kept for completeness;
-               the decoder ignores phase for additive sine synthesis)
+RSC2 Audio Codec - Encoder (optimized, u16 amp+phase edition)
 
-Per-partial record is now 6 bytes (was 10):  bin(u16) amp(u16) phase(u16)
+Binary format per frame (NEW):
+  peak       f32be   per-frame max FFT magnitude (for decoder reconstruction)
+  nPartials  u16be
+  [ bin(u16be)  amp(u16be)  phase(u16be) ] × nPartials
 
-Header is unchanged (still big-endian):
-  Magic      4 bytes  "RSC2"
-  version    u8
-  channels   u8
-  sampleRate u32be
-  fftSize    u16be
-  hopSize    u16be
-  maxPartials u16be
-  nFrames    u32be
-  nSamples   u32be
-  winSum     f32be   (kept so old tooling can still read the header)
+amp   0-65535  →  0.0–1.0  normalised to per-frame peak
+phase 0-65535  →  -π..π   (0 = -π, 65535 = +π)
+
+6 bytes per partial (down from 10 with f32 amp+phase).
 """
 import numpy as np
 import struct
@@ -29,7 +19,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from numpy.fft import rfft
 
-# ── Try Numba JIT ─────────────────────────────────────────────────────────────
+# ── Try to JIT compile the scoring kernel with Numba ─────────────────────────
 try:
     from numba import njit as _njit
 
@@ -54,7 +44,7 @@ try:
                 t3 = np.float32(0.0)
             if 0 < b < n - 1:
                 t5 = log_peak - (np.log(mags[b-1] + np.float32(1e-12))
-                                + np.log(mags[b+1] + np.float32(1e-12))) * np.float32(0.5)
+                                 + np.log(mags[b+1] + np.float32(1e-12))) * np.float32(0.5)
                 if t5 < 0.0:
                     t5 = np.float32(0.0)
             else:
@@ -66,101 +56,125 @@ try:
     _score_numba(_dummy, 8, 3)
     _USE_NUMBA = True
     print("⚡ Numba JIT enabled for scoring kernel")
+
 except Exception:
     _USE_NUMBA = False
 
 
 def _score_numpy(mags: np.ndarray, score_n: int, score_hole: int) -> np.ndarray:
-    n      = len(mags)
-    b_idx  = np.arange(n)
-    pad    = score_n
-    mpad   = np.pad(mags.astype(np.float64), pad, mode='constant')
-    cs     = np.concatenate(([0.0], np.cumsum(mpad)))
-    b_lo   = np.maximum(0,     b_idx - score_n)
-    b_hi   = np.minimum(n - 1, b_idx + score_n)
+    """Fully vectorized scoring — no Python loops."""
+    n    = len(mags)
+    b_idx = np.arange(n)
+
+    pad  = score_n
+    mpad = np.pad(mags.astype(np.float64), pad, mode='constant')
+    cs   = np.concatenate(([0.0], np.cumsum(mpad)))
+
+    b_lo = np.maximum(0, b_idx - score_n)
+    b_hi = np.minimum(n - 1, b_idx + score_n)
+
     win_sum = cs[b_hi + pad + 1] - cs[b_lo + pad]
     win_cnt = b_hi - b_lo + 1
-    h_lo   = np.maximum(b_lo, b_idx - score_hole)
-    h_hi   = np.minimum(b_hi, b_idx + score_hole)
+
+    h_lo     = np.maximum(b_lo, b_idx - score_hole)
+    h_hi     = np.minimum(b_hi, b_idx + score_hole)
     has_hole = h_lo <= h_hi
     hole_sum = np.where(has_hole, cs[h_hi + pad + 1] - cs[h_lo + pad], 0.0)
     hole_cnt = np.where(has_hole, h_hi - h_lo + 1, 0)
-    lmean    = (win_sum - hole_sum) / np.maximum(win_cnt - hole_cnt, 1).astype(np.float64)
+
+    lmean = (win_sum - hole_sum) / np.maximum(win_cnt - hole_cnt, 1).astype(np.float64)
+
     log_peak  = np.log(mags.astype(np.float64) + 1e-12)
     log_floor = np.log(lmean + 1e-12)
     t3 = np.maximum(0.0, log_peak - log_floor)
-    t5 = np.zeros(n, dtype=np.float64)
+
+    log_m = log_peak
+    t5    = np.zeros(n, dtype=np.float64)
     if n > 2:
-        inner = slice(1, n - 1)
-        t5[inner] = np.maximum(0.0, log_peak[inner] - 0.5 * (log_peak[:-2] + log_peak[2:]))
+        inner    = slice(1, n - 1)
+        t5[inner] = np.maximum(0.0, log_m[inner] - 0.5 * (log_m[:-2] + log_m[2:]))
+
     return ((t3 + t5) * mags).astype(np.float32)
 
 
-def compute_scores(mags, score_n=8, score_hole=3):
+def compute_scores(mags: np.ndarray, score_n: int = 8, score_hole: int = 3) -> np.ndarray:
     if _USE_NUMBA:
         return _score_numba(mags, score_n, score_hole)
     return _score_numpy(mags, score_n, score_hole)
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-RSC2_MAGIC    = b"RSC2"
-RSC2_VERSION  = 1
-FFT_SIZE      = 1024
-HOP_SIZE      = 1024
-MAX_PARTIALS  = 192
-SCORE_N       = 6
-SCORE_HOLE    = 2
+RSC2_MAGIC   = b"RSC2"
+RSC2_VERSION = 1
+FFT_SIZE     = 1024
+HOP_SIZE     = 1024
+MAX_PARTIALS = 192
+SCORE_N      = 6
+SCORE_HOLE   = 2
 
-# Header: version(B) channels(B) sampleRate(I) fftSize(H) hopSize(H)
-#         maxPartials(H) nFrames(I) nSamples(I) winSum(f)
 HEADER_FMT  = ">BBIHHHIIf"
-HEADER_SIZE = struct.calcsize(HEADER_FMT)   # 23 bytes
+HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
-# Per-partial: bin(u16) amp(u16) phase(u16) = 6 bytes  (was 10 with two f32s)
+# Per-frame header: peak magnitude (f32) + partial count (u16)
+FRAME_HDR_FMT  = ">fH"
+FRAME_HDR_SIZE = struct.calcsize(FRAME_HDR_FMT)   # 6
+
+# Per-partial record: bin(u16) amp(u16) phase(u16) = 6 bytes
 PARTIAL_FMT  = ">HHH"
-PARTIAL_SIZE = struct.calcsize(PARTIAL_FMT)  # 6
+PARTIAL_SIZE = struct.calcsize(PARTIAL_FMT)        # 6
 
-AMP_MAX   = 65535.0   # u16 full scale for amplitude
-PHASE_MAX = 65535.0   # u16 full scale for phase (0 → 0, 65535 → 2π)
-TWO_PI    = 2.0 * np.pi
+_TWO_PI     = 2.0 * np.pi
+_INV_TWO_PI = 1.0 / _TWO_PI
+_U16_MAX    = 65535.0
 
 
 def _encode_channel(args):
+    """Encode a single channel. Designed to run in a thread pool.
+
+    Returns:
+        all_frames  – list of (idx, amp_u16, ph_u16, peak_f32)
+        n_frames    – int
+    """
     sig, win, n_bins, fft_size, hop_size, max_partials = args
+
     n_samples = len(sig)
     n_frames  = max(0, (n_samples - fft_size) // hop_size + 1)
 
+    # Zero-copy strided view → windowed frames
     frame_shape   = (n_frames, fft_size)
     frame_strides = (sig.strides[0] * hop_size, sig.strides[0])
-    frames_raw    = np.lib.stride_tricks.as_strided(sig, shape=frame_shape, strides=frame_strides)
-    frames_win    = frames_raw * win[np.newaxis, :]
+    frames_raw    = np.lib.stride_tricks.as_strided(sig, shape=frame_shape,
+                                                    strides=frame_strides)
+    frames_win = frames_raw * win[np.newaxis, :]          # (n_frames, fft_size)
 
-    spec = rfft(frames_win, n=fft_size, axis=1)              # (n_frames, n_bins)
-    mags = np.abs(spec).astype(np.float32)                   # (n_frames, n_bins)
-    phs  = np.angle(spec).astype(np.float32)                 # (n_frames, n_bins) in [-π, π]
+    # Batch FFT
+    spec = rfft(frames_win, n=fft_size, axis=1)           # (n_frames, n_bins)
+    mags = np.abs(spec).astype(np.float32)                # (n_frames, n_bins)
+    phs  = np.angle(spec).astype(np.float32)              # (n_frames, n_bins)  -π..π
 
-    # Normalise magnitudes per-frame so amp u16 is relative (0=silent, 65535=peak)
-    frame_max = mags.max(axis=1, keepdims=True)
-    frame_max = np.where(frame_max < 1e-9, 1.0, frame_max)  # avoid /0
-    mags_norm = mags / frame_max                             # 0-1 float
-
+    k          = min(max_partials, n_bins)
     all_frames = []
-    k = min(max_partials, n_bins)
+
     for fi in range(n_frames):
         sc  = compute_scores(mags[fi], SCORE_N, SCORE_HOLE)
         idx = np.argpartition(sc, -k)[-k:]
-        idx = idx[np.argsort(sc[idx])[::-1]]
+        idx = idx[np.argsort(sc[idx])[::-1]]              # descending score
 
-        partials = []
-        for b in idx:
-            amp_u16   = int(round(float(mags_norm[fi, b]) * AMP_MAX))
-            amp_u16   = max(0, min(65535, amp_u16))
-            # phase: map [-π, π] → [0, 65535]
-            phase_u16 = int(round((float(phs[fi, b]) + np.pi) / TWO_PI * PHASE_MAX))
-            phase_u16 = max(0, min(65535, phase_u16))
-            partials.append((int(b), amp_u16, phase_u16))
+        # ── Per-frame amplitude normalisation → u16 ──────────────────────────
+        sel_mags = mags[fi][idx]
+        peak     = float(sel_mags.max()) if len(sel_mags) else 0.0
+        if peak < 1e-12:
+            peak = 1.0   # silent frame: store ones, decoder will produce silence
 
-        all_frames.append(partials)
+        amp_u16 = np.clip(sel_mags / peak * _U16_MAX, 0.0, _U16_MAX
+                          ).round().astype(np.uint16)
+
+        # ── Phase -π..π → 0..65535 ───────────────────────────────────────────
+        sel_phs = phs[fi][idx]
+        ph_u16  = np.clip((sel_phs + np.pi) * _INV_TWO_PI * _U16_MAX,
+                          0.0, _U16_MAX).round().astype(np.uint16)
+
+        all_frames.append((idx, amp_u16, ph_u16, peak))
 
     return all_frames, n_frames
 
@@ -171,7 +185,7 @@ def encode(pcm: np.ndarray, sample_rate: int, n_channels: int) -> bytes:
     n_samples, channels = pcm.shape
 
     win     = np.ones(FFT_SIZE, dtype=np.float32)
-    win_sum = float(win.sum())
+    win_sum = float(win.sum())                            # = FFT_SIZE for rect window
     n_bins  = FFT_SIZE // 2 + 1
 
     channel_args = [
@@ -185,29 +199,40 @@ def encode(pcm: np.ndarray, sample_rate: int, n_channels: int) -> bytes:
 
     n_frames = results[0][1]
 
-    # Pre-calculate exact buffer size:
-    #   4 (magic) + HEADER_SIZE
-    #   + per channel * per frame: 2 (n_partials u16) + MAX_PARTIALS * PARTIAL_SIZE
-    buf_size = (4 + HEADER_SIZE
-                + channels * n_frames * 2
-                + channels * n_frames * MAX_PARTIALS * PARTIAL_SIZE)
+    # Pre-allocate output buffer (exact size)
+    buf_size = (
+        4                                               # magic
+        + HEADER_SIZE                                   # global header
+        + channels * n_frames * FRAME_HDR_SIZE          # peak + nPartials per frame
+        + channels * n_frames * MAX_PARTIALS * PARTIAL_SIZE  # partial records
+    )
     buf = bytearray(buf_size)
     off = 0
 
-    buf[off:off+4] = RSC2_MAGIC; off += 4
+    # Magic
+    buf[off:off + 4] = RSC2_MAGIC
+    off += 4
 
+    # Global header
     struct.pack_into(HEADER_FMT, buf, off,
                      RSC2_VERSION, channels, sample_rate,
                      FFT_SIZE, HOP_SIZE, MAX_PARTIALS,
                      n_frames, n_samples, win_sum)
     off += HEADER_SIZE
 
+    # Frame data — channel-major order
     for ch_frames, _ in results:
-        for partials in ch_frames:
-            n_p = len(partials)
-            struct.pack_into(">H", buf, off, n_p); off += 2
-            for b, amp_u16, phase_u16 in partials:
-                struct.pack_into(PARTIAL_FMT, buf, off, b, amp_u16, phase_u16)
+        for idx, amp_u16, ph_u16, peak in ch_frames:
+            n_p = len(idx)
+            # Frame header: peak magnitude + partial count
+            struct.pack_into(FRAME_HDR_FMT, buf, off, peak, n_p)
+            off += FRAME_HDR_SIZE
+            # Partial records
+            for i in range(n_p):
+                struct.pack_into(PARTIAL_FMT, buf, off,
+                                 int(idx[i]),
+                                 int(amp_u16[i]),
+                                 int(ph_u16[i]))
                 off += PARTIAL_SIZE
 
     return bytes(buf[:off])
@@ -227,34 +252,22 @@ def load_wav(path: str):
 
 
 def main():
-    global MAX_PARTIALS, FFT_SIZE, HOP_SIZE
     ap = argparse.ArgumentParser(description="RSC2 encoder (u16 amp+phase)")
     ap.add_argument("input")
     ap.add_argument("output")
-    ap.add_argument("--no-numba", action="store_true")
-    ap.add_argument("--max-partials", type=int, default=MAX_PARTIALS,
-                    help=f"Partials per frame per channel (default {MAX_PARTIALS})")
-    ap.add_argument("--fft-size", type=int, default=FFT_SIZE,
-                    help=f"FFT window size (default {FFT_SIZE})")
-    ap.add_argument("--hop-size", type=int, default=HOP_SIZE,
-                    help=f"Hop size in samples (default {HOP_SIZE})")
+    ap.add_argument("--no-numba", action="store_true",
+                    help="Force pure-numpy scoring even if Numba is available")
     a = ap.parse_args()
 
     if a.no_numba:
         global _USE_NUMBA
         _USE_NUMBA = False
-
-    # Allow overriding globals via CLI
-    
-    MAX_PARTIALS = a.max_partials
-    FFT_SIZE     = a.fft_size
-    HOP_SIZE     = a.hop_size
+        print("🔧 Numba disabled (--no-numba)")
 
     print(f"🎵 Loading {a.input}…")
     pcm, sr, ch = load_wav(a.input)
     print(f"   {sr} Hz | {ch} ch | {len(pcm)} samples")
-    print(f"⚙️  Encoding (FFT={FFT_SIZE}, hop={HOP_SIZE}, partials={MAX_PARTIALS})…")
-    print(f"   Partial record: bin(u16) + amp(u16) + phase(u16) = 6 bytes")
+    print(f"⚙️  Encoding (FFT={FFT_SIZE}, hop={HOP_SIZE}, max_partials={MAX_PARTIALS})…")
 
     import time
     t0   = time.perf_counter()
@@ -265,10 +278,9 @@ def main():
         f.write(data)
 
     ratio = (len(pcm) / sr) / dt if dt > 0 else float('inf')
-    orig  = len(pcm) * ch * 2   # approximate PCM16 size for comparison
-    print(f"✅ Written {len(data):,} bytes → {a.output}  "
-          f"({len(data)/orig*100:.1f}% of PCM16)")
-    print(f"   Encoded in {dt*1000:.1f} ms  ({ratio:.1f}× real-time)")
+    print(f"✅ Written {len(data):,} bytes → {a.output}")
+    print(f"   Encoded in {dt * 1000:.1f} ms  ({ratio:.1f}× real-time)")
+    print(f"   Partial record: {PARTIAL_SIZE} bytes  (u16 bin + u16 amp + u16 phase)")
 
 
 if __name__ == "__main__":
