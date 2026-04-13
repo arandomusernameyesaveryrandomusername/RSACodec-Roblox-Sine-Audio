@@ -23,15 +23,15 @@ import wave
 import argparse
 
 RSC2_MAGIC  = b"RSC2"
-HEADER_FMT  = ">BBIHHHIIf"
+HEADER_FMT  = "<BBIHHHIIf"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 # Per-frame header written by encoder: peak(f32be) + nPartials(u16be)
-FRAME_HDR_FMT  = ">fH"
+FRAME_HDR_FMT  = "<fH"
 FRAME_HDR_SIZE = struct.calcsize(FRAME_HDR_FMT)   # 6
 
 # Per-partial record: bin(u16be) amp(u16be) phase(u16be)
-PARTIAL_FMT  = ">HHH"
+PARTIAL_FMT  = "<HHH"
 PARTIAL_SIZE = struct.calcsize(PARTIAL_FMT)        # 6
 
 _U16_MAX    = 65535.0

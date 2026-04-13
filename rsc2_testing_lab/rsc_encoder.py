@@ -112,15 +112,15 @@ MAX_PARTIALS = 192
 SCORE_N      = 6
 SCORE_HOLE   = 2
 
-HEADER_FMT  = ">BBIHHHIIf"
+HEADER_FMT  = "<BBIHHHIIf"
 HEADER_SIZE = struct.calcsize(HEADER_FMT)
 
 # Per-frame header: peak magnitude (f32) + partial count (u16)
-FRAME_HDR_FMT  = ">fH"
+FRAME_HDR_FMT  = "<fH"
 FRAME_HDR_SIZE = struct.calcsize(FRAME_HDR_FMT)   # 6
 
 # Per-partial record: bin(u16) amp(u16) phase(u16) = 6 bytes
-PARTIAL_FMT  = ">HHH"
+PARTIAL_FMT  = "<HHH"
 PARTIAL_SIZE = struct.calcsize(PARTIAL_FMT)        # 6
 
 _TWO_PI     = 2.0 * np.pi
