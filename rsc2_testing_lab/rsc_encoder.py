@@ -16,6 +16,8 @@ import numpy as np
 import struct
 import wave
 import argparse
+import time
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from numpy.fft import rfft
 
@@ -101,6 +103,77 @@ def compute_scores(mags: np.ndarray, score_n: int = 8, score_hole: int = 3) -> n
     if _USE_NUMBA:
         return _score_numba(mags, score_n, score_hole)
     return _score_numpy(mags, score_n, score_hole)
+
+
+# ── Progress Bar Helper ───────────────────────────────────────────────────────
+class ProgressBar:
+    def __init__(self, total: int, desc: str = "Progress", width: int = 50, unit: str = "items"):
+        self.total = total
+        self.desc = desc
+        self.width = width
+        self.unit = unit
+        self.current = 0
+        self.start_time = time.perf_counter()
+        self.last_update = self.start_time
+        self.last_render_time = self.start_time
+        self.target_screen_fps = 60.0
+        self.screen_interval = 1.0 / self.target_screen_fps
+
+    def update(self, amount: int = 1, force: bool = False) -> None:
+        self.current = min(self.current + amount, self.total)
+        now = time.perf_counter()
+        
+        # Update screen at ~60 FPS for smooth animation
+        if (now - self.last_render_time) >= self.screen_interval or force or self.current >= self.total:
+            self._render(now)
+            self.last_render_time = now
+
+    def _render(self, now: float) -> None:
+        elapsed = now - self.start_time
+        
+        # Calculate processing speed (items/second)
+        if elapsed > 0.1:  # Only show speed after 0.1s to avoid noise
+            speed = self.current / elapsed
+        else:
+            speed = 0
+
+        # Calculate progress
+        pct = self.current / self.total if self.total > 0 else 0.0
+        filled = int(self.width * pct)
+        bar = "█" * filled + "░" * (self.width - filled)
+
+        # Calculate ETA
+        if pct > 0 and elapsed > 0:
+            total_time = elapsed / pct
+            eta_sec = total_time - elapsed
+            eta_str = self._format_time(eta_sec)
+        else:
+            eta_str = "--:--"
+
+        elapsed_str = self._format_time(elapsed)
+
+        # Build output
+        line = (f"\r{self.desc:20} │{bar}│ {self.current:6}/{self.total:6} "
+                f"[{elapsed_str} < {eta_str}] {speed:7.1f} {self.unit}/s")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        """Format seconds as HH:MM:SS or MM:SS"""
+        if seconds < 0:
+            seconds = 0
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def finish(self) -> None:
+        self.current = self.total
+        self._render(time.perf_counter())
+        print()  # newline
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -194,9 +267,15 @@ def encode(pcm: np.ndarray, sample_rate: int, n_channels: int) -> bytes:
         for ch in range(channels)
     ]
 
+    pbar = ProgressBar(channels, "Encoding channels", width=40, unit="ch")
+    
     with ThreadPoolExecutor(max_workers=channels) as ex:
-        results = list(ex.map(_encode_channel, channel_args))
-
+        results = []
+        for future in ex.map(_encode_channel, channel_args):
+            results.append(future)
+            pbar.update(1)
+    
+    pbar.finish()
     n_frames = results[0][1]
 
     # Pre-allocate output buffer (exact size)
@@ -221,6 +300,7 @@ def encode(pcm: np.ndarray, sample_rate: int, n_channels: int) -> bytes:
     off += HEADER_SIZE
 
     # Frame data — channel-major order
+    pbar_write = ProgressBar(channels * n_frames, "Writing frames", width=40, unit="frames")
     for ch_frames, _ in results:
         for idx, amp_u16, ph_u16, peak in ch_frames:
             n_p = len(idx)
@@ -234,7 +314,9 @@ def encode(pcm: np.ndarray, sample_rate: int, n_channels: int) -> bytes:
                                  int(amp_u16[i]),
                                  int(ph_u16[i]))
                 off += PARTIAL_SIZE
-
+            pbar_write.update(1)
+    
+    pbar_write.finish()
     return bytes(buf[:off])
 
 
@@ -269,7 +351,6 @@ def main():
     print(f"   {sr} Hz | {ch} ch | {len(pcm)} samples")
     print(f"⚙️  Encoding (FFT={FFT_SIZE}, hop={HOP_SIZE}, max_partials={MAX_PARTIALS})…")
 
-    import time
     t0   = time.perf_counter()
     data = encode(pcm, sr, ch)
     dt   = time.perf_counter() - t0

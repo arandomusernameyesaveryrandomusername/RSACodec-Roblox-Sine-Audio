@@ -21,6 +21,8 @@ import numpy as np
 import struct
 import wave
 import argparse
+import time
+import sys
 
 RSC2_MAGIC  = b"RSC2"
 HEADER_FMT  = "<BBIHHHIIf"
@@ -36,6 +38,77 @@ PARTIAL_SIZE = struct.calcsize(PARTIAL_FMT)        # 6
 
 _U16_MAX    = 65535.0
 _TWO_PI     = 2.0 * np.pi
+
+
+# ── Progress Bar Helper ───────────────────────────────────────────────────────
+class ProgressBar:
+    def __init__(self, total: int, desc: str = "Progress", width: int = 50, unit: str = "items"):
+        self.total = total
+        self.desc = desc
+        self.width = width
+        self.unit = unit
+        self.current = 0
+        self.start_time = time.perf_counter()
+        self.last_update = self.start_time
+        self.last_render_time = self.start_time
+        self.target_screen_fps = 60.0
+        self.screen_interval = 1.0 / self.target_screen_fps
+
+    def update(self, amount: int = 1, force: bool = False) -> None:
+        self.current = min(self.current + amount, self.total)
+        now = time.perf_counter()
+        
+        # Update screen at ~60 FPS for smooth animation
+        if (now - self.last_render_time) >= self.screen_interval or force or self.current >= self.total:
+            self._render(now)
+            self.last_render_time = now
+
+    def _render(self, now: float) -> None:
+        elapsed = now - self.start_time
+        
+        # Calculate processing speed (items/second)
+        if elapsed > 0.1:  # Only show speed after 0.1s to avoid noise
+            speed = self.current / elapsed
+        else:
+            speed = 0
+
+        # Calculate progress
+        pct = self.current / self.total if self.total > 0 else 0.0
+        filled = int(self.width * pct)
+        bar = "█" * filled + "░" * (self.width - filled)
+
+        # Calculate ETA
+        if pct > 0 and elapsed > 0:
+            total_time = elapsed / pct
+            eta_sec = total_time - elapsed
+            eta_str = self._format_time(eta_sec)
+        else:
+            eta_str = "--:--"
+
+        elapsed_str = self._format_time(elapsed)
+
+        # Build output
+        line = (f"\r{self.desc:20} │{bar}│ {self.current:6}/{self.total:6} "
+                f"[{elapsed_str} < {eta_str}] {speed:7.1f} {self.unit}/s")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    @staticmethod
+    def _format_time(seconds: float) -> str:
+        """Format seconds as HH:MM:SS or MM:SS"""
+        if seconds < 0:
+            seconds = 0
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = int(seconds % 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def finish(self) -> None:
+        self.current = self.total
+        self._render(time.perf_counter())
+        print()  # newline
 
 
 def decode(data: bytes):
@@ -59,6 +132,8 @@ def decode(data: bytes):
     total  = n_samples + fft_size          # safe output buffer length
 
     pcm = np.zeros((total, channels), dtype=np.float32)
+
+    pbar = ProgressBar(channels * n_frames, "Decoding frames", width=40, unit="frames")
 
     for ch in range(channels):
         ch_pcm = np.zeros(total, dtype=np.float32)
@@ -90,10 +165,13 @@ def decode(data: bytes):
             ch_cnt[pos:end] += 1.0
             pos += hop_size
 
+            pbar.update(1)
+
         # Divide by overlap count (always 1 for hop=fft_size, but kept for safety)
         ch_cnt = np.where(ch_cnt < 1e-8, 1.0, ch_cnt)
         pcm[:, ch] = ch_pcm / ch_cnt
 
+    pbar.finish()
     return pcm[:n_samples, :], sample_rate, channels
 
 
@@ -119,11 +197,14 @@ def main():
     print(f"   {len(data):,} bytes")
 
     print("⚙️  Decoding…")
+    t0 = time.perf_counter()
     pcm, sr, ch = decode(data)
+    dt = time.perf_counter() - t0
 
     print(f"💾 Writing {a.output}…")
     save_wav(a.output, pcm, sr)
     print(f"✅ Done  ({len(pcm)} samples, {sr} Hz, {ch} ch)")
+    print(f"   Decoded in {dt * 1000:.1f} ms")
 
 
 if __name__ == "__main__":
