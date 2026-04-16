@@ -17,10 +17,7 @@ Reconstruction per frame:
   amp   = (amp_u16  / 65535.0) * peak          → absolute FFT magnitude
   phase = (ph_u16   / 65535.0) * 2π  - π       → radians
   spec[bin] = amp * exp(j * phase)
-  frame = irfft(spec, n=fft_size)               → no extra amp_corr needed;
-                                                   irfft(rfft(x)) = x for the
-                                                   rectangular window used by
-                                                   the encoder (win_sum = fft_size)
+  Reconstruction via Additive Synthesis (fast Numba-optimized loop) +
   OLA with rectangular accumulation + divide by overlap count
 """
 import numpy as np

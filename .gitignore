@@ -17,3 +17,42 @@ __pycache__/
 *.lock
 # Mac Specific
 .DS_Store
+local function buildSoundPool(nSlots)
+	local pool      = tcreate(nSlots)
+	local container = Instance.new("Folder")
+	container.Name   = "RSC2_SoundPool"
+	container.Parent = SoundService
+
+	for i = 1, nSlots do
+		local s = Instance.new("Sound")
+		s.SoundId            = SINE_ASSET_ID
+		s.Volume             = 0
+		s.Looped             = true
+		s.RollOffMaxDistance = 0
+		s.Parent             = container
+		pool[i] = s
+	end
+
+	-- Wait for asset to load on the first sound instance
+	if not pool[1].IsLoaded then
+		local loaded = false
+		local connection
+		connection = pool[1].Loaded:Connect(function() 
+			loaded = true 
+			connection:Disconnect()
+		end)
+		
+		local t = 0
+		while not loaded and t < 10 do
+			task.wait(0.1)
+			t += 0.1
+		end
+	end
+
+	-- Start all sounds in the pool (muted)
+	for i = 1, nSlots do 
+		pool[i]:Play() 
+	end
+
+	return pool, container
+end
