@@ -140,6 +140,8 @@ function SinePool.new(parent, size, sample_rate)
 	self.amps = {}
 	self.phases = {}
 	self.active = {}
+	self.bin_to_slot = {}
+	self.slot_to_bin = {}
 	self.sample_rate = sample_rate
 	self.size = size
 
@@ -148,13 +150,35 @@ function SinePool.new(parent, size, sample_rate)
 		self.amps[i] = 0
 		self.phases[i] = 0
 		self.active[i] = false
+		self.slot_to_bin[i] = nil
 	end
 	return self
 end
 
-function SinePool:allocate(freq, amp, phase)
-	-- Find inactive sound or reuse oldest
-	local idx = nil
+function SinePool:_setSound(idx, freq, amp, phase)
+	self.freqs[idx] = freq
+	self.amps[idx] = amp
+	self.phases[idx] = phase
+
+	local sound = self.sounds[idx]
+	local speed = math.max(freq / 1000, 0.01)
+	sound.PlaybackSpeed = speed
+	sound.Volume = amp
+
+	local phase_norm = (phase / (2 * math.pi)) % 1
+	sound.TimePosition = phase_norm / 1000
+end
+
+function SinePool:assign(bin, freq, amp, phase)
+	local idx = self.bin_to_slot[bin]
+
+	if idx and self.active[idx] then
+		-- Update existing partial
+		self:_setSound(idx, freq, amp, phase)
+		return idx
+	end
+
+	-- Allocate a free slot
 	for i = 1, self.size do
 		if not self.active[i] then
 			idx = i
@@ -163,33 +187,45 @@ function SinePool:allocate(freq, amp, phase)
 	end
 
 	if not idx then
-		idx = 1  -- Fallback: reuse first sound
+		idx = 1
+		local old_bin = self.slot_to_bin[idx]
+		if old_bin then
+			self.bin_to_slot[old_bin] = nil
+		end
 	end
 
-	self.freqs[idx] = freq
-	self.amps[idx] = amp
-	self.phases[idx] = phase
 	self.active[idx] = true
+	self.bin_to_slot[bin] = idx
+	self.slot_to_bin[idx] = bin
 
-	local sound = self.sounds[idx]
-	local speed = math.max(freq / 1000, 0.01)
-	sound.PlaybackSpeed = speed
-	sound.Volume = amp
-
-	-- Sync initial phase by adjusting start offset in the 1000Hz sine asset
-	local phase_norm = (phase / (2 * math.pi)) % 1
-	sound.TimePosition = phase_norm / 1000
-
+	self:_setSound(idx, freq, amp, phase)
 	return idx
 end
 
 function SinePool:release(idx)
+	local old_bin = self.slot_to_bin[idx]
+	if old_bin then
+		self.bin_to_slot[old_bin] = nil
+		self.slot_to_bin[idx] = nil
+	end
+
 	self.active[idx] = false
+	self.amps[idx] = 0
 	self.sounds[idx].Volume = 0
 end
 
+function SinePool:releaseUnused(active_bins)
+	for i = 1, self.size do
+		if self.active[i] then
+			local bin = self.slot_to_bin[i]
+			if not active_bins[bin] then
+				self:release(i)
+			end
+		end
+	end
+end
+
 function SinePool:update(delta_time)
-	-- Update volume for each active sound; playback speed is set on allocation
 	for i = 1, self.size do
 		if self.active[i] then
 			self.sounds[i].Volume = self.amps[i]
@@ -287,17 +323,14 @@ function RSC2:playFrame(frame_idx)
 
 	-- Read first channel for now (mono playback)
 	local partials = self:readFrame(frame_idx, 0)
+	local active_bins = {}
 
-	-- Release all active sounds
-	for i = 1, self.pool.size do
-		self.pool:release(i)
-	end
-
-	-- Allocate new sounds for this frame
 	for _, partial in ipairs(partials) do
-		self.pool:allocate(partial.freq, partial.amp, partial.phase)
+		active_bins[partial.bin] = true
+		self.pool:assign(partial.bin, partial.freq, partial.amp, partial.phase)
 	end
 
+	self.pool:releaseUnused(active_bins)
 	self.current_frame = frame_idx
 end
 
