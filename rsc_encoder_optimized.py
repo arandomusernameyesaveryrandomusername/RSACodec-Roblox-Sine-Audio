@@ -53,7 +53,7 @@ try:
                     t5 = np.float32(0.0)
             else:
                 t5 = np.float32(0.0)
-            score[b] = mags[b] * (t3 + t5)
+            score[b] = mags[b] + t3 + t5
         return score
 
     _dummy = np.ones(513, dtype=np.float32)
