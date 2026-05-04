@@ -114,7 +114,7 @@ def compute_scores(mags: np.ndarray, score_n: int = 8, score_hole: int = 3) -> n
 RSC2_MAGIC   = b"RSC2"
 RSC2_VERSION = 1
 FFT_SIZE     = 1024
-HOP_SIZE     = 1024
+HOP_SIZE     = FFT_SIZE
 MAX_PARTIALS = 192
 SCORE_N      = 6
 SCORE_HOLE   = 2
