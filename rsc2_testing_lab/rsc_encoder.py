@@ -54,6 +54,13 @@ try:
             else:
                 t5 = np.float32(0.0)
             score[b] = mags[b] * (t3 + t5)
+
+            
+            if (score[b] > score[b - 1] and score[b] > score[b + 1]
+            and score[b] > np.float32(1e-12)):
+                score[b-1] = np.float32(0.0)
+                score[b+1] = np.float32(0.0) 
+
         return score
 
     _dummy = np.ones(513, dtype=np.float32)
@@ -114,8 +121,8 @@ def compute_scores(mags: np.ndarray, score_n: int = 8, score_hole: int = 3) -> n
 RSC2_MAGIC   = b"RSC2"
 RSC2_VERSION = 1
 FFT_SIZE     = 1024
-HOP_SIZE     = FFT_SIZE
-MAX_PARTIALS = 96
+HOP_SIZE     = 1024
+MAX_PARTIALS = 192
 SCORE_N      = 6
 SCORE_HOLE   = 2
 
