@@ -1,5 +1,7 @@
-**FINISHED PROJECT***
+**FINISHED PROJECT**
+
 This is probably the last commit before I abandon this project!
+
 It was a very very well performing codec, but its time to sunset it.
 
 Just sine-wave stuff  
