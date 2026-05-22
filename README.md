@@ -4,6 +4,8 @@ This is probably the last commit before I abandon this project!
 
 It was a very very well performing codec, but its time to sunset it.
 
+In the future, I may port this project to other platforms, such as **Desmos**.
+
 Just sine-wave stuff  
 Audio goes in clean come out not so clean on the other side
 
