@@ -1,0 +1,4 @@
+RSC2 → Desmos  expression listing
+============================================================
+
+  Oscillators are created on-demand by the player JS and reclaimed when idle
